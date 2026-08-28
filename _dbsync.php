@@ -16,7 +16,10 @@
  *   _dbsync.php?action=delete (POST files[]) -> usuniecie zaznaczonych plikow
  *
  * Dane dostepowe do bazy (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) sa
- * czytane z wp-config.php. Do zrzutu uzywana jest binarka mysqldump,
+ * czytane po kolei z:
+ *   - wp-config.php (WordPress) - jesli istnieje
+ *   - app/config/parameters.php (PrestaShop) - jesli nie ma wp-config.php
+ * Do zrzutu uzywana jest binarka mysqldump,
  * do importu binarka mysql. Jesli binarki nie sa w PATH, sciezke mozna
  * podac recznie:
  *
@@ -130,6 +133,56 @@ function db_sync_parse_wp_config($path)
         }
     }
     return $creds;
+}
+
+function db_sync_parse_ps_config($path)
+{
+    $text = @file_get_contents($path);
+    if ($text === false) {
+        throw new Exception('Nie moge odczytac pliku parameters.php: ' . $path);
+    }
+    $creds = array('DB_NAME' => '', 'DB_USER' => '', 'DB_PASSWORD' => '', 'DB_HOST' => '');
+    $port  = '';
+    $map = array(
+        'database_name'     => 'DB_NAME',
+        'database_user'     => 'DB_USER',
+        'database_password' => 'DB_PASSWORD',
+        'database_host'     => 'DB_HOST',
+        'database_port'     => 'DB_PORT',
+    );
+    foreach ($map as $psKey => $outKey) {
+        if (!preg_match("/'" . preg_quote($psKey, '/') . "'\s*=>\s*(?:'([^']*)'|\"([^\"]*)\"|NULL)/i", $text, $m)) {
+            continue;
+        }
+        $val = '';
+        if (isset($m[1]) && $m[1] !== '') {
+            $val = $m[1];
+        } elseif (isset($m[2]) && $m[2] !== '') {
+            $val = $m[2];
+        }
+        if ($outKey === 'DB_PORT') {
+            $port = $val;
+        } else {
+            $creds[$outKey] = $val;
+        }
+    }
+    if ($port !== '' && strpos($creds['DB_HOST'], '/') !== 0 && strpos($creds['DB_HOST'], ':') === false) {
+        $creds['DB_HOST'] = $creds['DB_HOST'] . ':' . $port;
+    }
+    return $creds;
+}
+
+function db_sync_creds_from_disk()
+{
+    $wp = __DIR__ . '/wp-config.php';
+    if (is_file($wp)) {
+        return array('source' => 'wp-config.php', 'creds' => db_sync_parse_wp_config($wp));
+    }
+    $ps = __DIR__ . '/app/config/parameters.php';
+    if (is_file($ps)) {
+        return array('source' => 'app/config/parameters.php (PrestaShop)', 'creds' => db_sync_parse_ps_config($ps));
+    }
+    throw new Exception('Nie znaleziono konfiguracji bazy danych (wp-config.php ani app/config/parameters.php).');
 }
 
 function db_sync_host_port($host)
@@ -605,8 +658,10 @@ try {
         throw new Exception($pendingError);
     }
 
-    $creds = db_sync_parse_wp_config(__DIR__ . '/wp-config.php');
+    $dbConfig = db_sync_creds_from_disk();
+    $creds = $dbConfig['creds'];
 
+    db_sync_log('KONFIGURACJA', 'odczytano z ' . $dbConfig['source']);
     list($host, $port) = db_sync_host_port($creds['DB_HOST']);
 
     db_sync_log('KONFIGURACJA', db_sync_creds_summary($creds));
@@ -619,7 +674,7 @@ try {
     }
 
     if (($action === 'dump' || $action === 'sync') && ($creds['DB_NAME'] === '' || $creds['DB_USER'] === '')) {
-        throw new Exception('Nie udalo sie odczytac danych bazy z wp-config.php (DB_NAME/DB_USER) - nie moge wykonac akcji.');
+        throw new Exception('Nie udalo sie odczytac danych bazy z konfiguracji (DB_NAME/DB_USER) - nie moge wykonac akcji.');
     }
 
     if ($action === 'dump') {
