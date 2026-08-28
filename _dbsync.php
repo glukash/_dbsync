@@ -39,6 +39,30 @@ ini_set('memory_limit', '512M');
 set_time_limit(0);
 header('Content-Type: text/html; charset=utf-8');
 
+/* ---- Polyfill dla PHP < 5.6 ---- */
+if (!function_exists('hash_equals')) {
+    function hash_equals($known_string, $user_string)
+    {
+        $known_string = (string) $known_string;
+        $user_string  = (string) $user_string;
+        $known_len = strlen($known_string);
+        $user_len  = strlen($user_string);
+        if ($known_len !== $user_len) {
+            return false;
+        }
+        $result = 0;
+        for ($i = 0; $i < $known_len; $i++) {
+            $result |= ord($known_string[$i]) ^ ord($user_string[$i]);
+        }
+        return $result === 0;
+    }
+}
+
+/* ---- Polyfill dla PHP < 7.2 (brak stałej PHP_OS_FAMILY) ---- */
+if (!defined('PHP_OS_FAMILY')) {
+    define('PHP_OS_FAMILY', (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN' ? 'Windows' : 'Unknown'));
+}
+
 define('DB_SYNC_DIR',  __DIR__ . '/_dbsync');
 
 /* Dane logowania do narzedzia (niezalezne od konta WordPressa). */
