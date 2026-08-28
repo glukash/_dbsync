@@ -96,6 +96,11 @@ function db_sync_log_raw($text)
     flush();
 }
 
+function db_sync_mask_password($cmd)
+{
+    return preg_replace('/--password=\S+/', '--password=***', $cmd);
+}
+
 function db_sync_exec($cmd, &$output, &$code)
 {
     $output = array();
@@ -405,7 +410,7 @@ function db_sync_dump($creds, $host, $port)
         . ' ' . escapeshellarg($creds['DB_NAME'])
         . ' 2>&1';
 
-    db_sync_log('KOMENDA', $cmd);
+    db_sync_log('KOMENDA', db_sync_mask_password($cmd));
     db_sync_exec($cmd, $output, $code);
 
     if ($code !== 0 || !is_file($sqlFile) || filesize($sqlFile) === 0) {
@@ -448,7 +453,7 @@ function db_sync_import($creds, $host, $port, $file)
         . ' < ' . escapeshellarg($sqlFile)
         . ' 2>&1';
 
-    db_sync_log('KOMENDA', $cmd);
+    db_sync_log('KOMENDA', db_sync_mask_password($cmd));
     db_sync_exec($cmd, $output, $code);
 
     if ($code !== 0) {
