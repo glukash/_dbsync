@@ -647,7 +647,10 @@ flush();
 
 $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : 'nieznany');
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . '</b></div>' . "\n";
+$isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
+$serverColor = $isLocal ? '#e80' : '#ff0000';
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.1, 2026-08-28</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | ' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . '</b></div>' . "\n";
 flush();
 
 try {
