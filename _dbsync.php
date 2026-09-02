@@ -698,11 +698,31 @@ function db_sync_prepend_comment($sqlFile, $dbName, $exclude)
 {
     $comment = '-- _dbsync partial dump; baza: ' . $dbName
         . '; wykluczone tabele: ' . implode(', ', $exclude) . "\n";
-    $content = @file_get_contents($sqlFile);
-    if ($content === false) {
+    $tmp = $sqlFile . '.tmp';
+    $in  = @fopen($sqlFile, 'rb');
+    $out = @fopen($tmp, 'wb');
+    if ($in === false || $out === false) {
+        if (is_resource($in)) {
+            fclose($in);
+        }
+        if (is_resource($out)) {
+            fclose($out);
+        }
+        @unlink($tmp);
         return;
     }
-    @file_put_contents($sqlFile, $comment . $content);
+    fwrite($out, $comment);
+    while (!feof($in)) {
+        $chunk = fread($in, 1048576);
+        if ($chunk === false) {
+            break;
+        }
+        fwrite($out, $chunk);
+    }
+    fclose($in);
+    fclose($out);
+    @rename($tmp, $sqlFile);
+    @unlink($tmp);
 }
 
 /* ------------------------------------------------------------------ */
@@ -877,7 +897,7 @@ $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset(
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
 $isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
 $serverColor = $isLocal ? '#e80' : '#ff0000';
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.4, 2026-09-02</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.6, 2026-09-02</b></div>' . "\n";
 $httpHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'nieznany';
 $cwd      = function_exists('getcwd') ? getcwd() : 'nieznany';
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . ' | SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | DOMENA: ' . htmlspecialchars($httpHost) . ' | KATALOG: ' . htmlspecialchars($cwd) . '</b></div>' . "\n";
