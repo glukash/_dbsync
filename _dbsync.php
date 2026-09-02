@@ -241,9 +241,9 @@ function db_sync_dump_filename($dbName, $exclude = array(), $prefix = '')
             }
             $shown[] = db_sync_safe_name($short);
         }
-        $suffix = implode('__', $shown);
+        $suffix = implode('-', $shown);
         if (count($exclude) > 5) {
-            $suffix .= '__+' . (count($exclude) - 5) . ' wiecej';
+            $suffix .= '+' . (count($exclude) - 5);
         }
         $suffix = '_EXCLUDE[' . $suffix . ']';
     }
@@ -935,7 +935,7 @@ $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset(
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
 $isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
 $serverColor = $isLocal ? '#e80' : '#ff0000';
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.7, 2026-09-02</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.11, 2026-09-02</b></div>' . "\n";
 $httpHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'nieznany';
 $cwd      = function_exists('getcwd') ? getcwd() : 'nieznany';
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . ' | SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | DOMENA: ' . htmlspecialchars($httpHost) . ' | KATALOG: ' . htmlspecialchars($cwd) . '</b></div>' . "\n";
