@@ -203,9 +203,22 @@ function db_sync_safe_name($name)
     return preg_replace('/[^A-Za-z0-9_-]/', '_', $name);
 }
 
-function db_sync_dump_filename($dbName)
+function db_sync_dump_filename($dbName, $exclude = array())
 {
-    return date('ymd-His') . '-dump-' . db_sync_safe_name($dbName) . '.sql';
+    $name = db_sync_safe_name($dbName);
+    $suffix = '';
+    if (!empty($exclude)) {
+        $shown = array();
+        foreach (array_slice($exclude, 0, 4) as $t) {
+            $shown[] = db_sync_safe_name($t);
+        }
+        $suffix = implode('__', $shown);
+        if (count($exclude) > 4) {
+            $suffix .= '__+' . (count($exclude) - 4) . ' wiecej';
+        }
+        $suffix = '_EXCLUDE[' . $suffix . ']';
+    }
+    return date('ymd-His') . '-dump-' . $name . $suffix . '.sql';
 }
 
 function db_sync_file_path($file)
@@ -249,7 +262,7 @@ function db_sync_creds_summary($creds)
 
 function db_sync_test_connection($creds, $host, $port)
 {
-    $mysql = !empty($_GET['MYSQL']) ? trim($_GET['MYSQL']) : '';
+    $mysql = db_sync_get_param('MYSQL');
     if ($mysql === '') {
         $mysql = db_sync_find_binary(array('mysql', 'mysql.exe'), db_sync_binary_candidates('mysql'));
     }
@@ -314,6 +327,78 @@ function db_sync_render_list()
     echo '<form method="get" action="" style="margin:14px 0 0">'
         . '<input type="hidden" name="action" value="dump">'
         . '<button type="submit" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#080;color:#fff;border:0;border-radius:4px">Generuj nowy dump bazy</button>'
+        . '</form>';
+    echo '</div>';
+}
+
+function db_sync_table_size_label($bytes)
+{
+    $bytes = (float) $bytes;
+    if ($bytes <= 0) {
+        return '&mdash;';
+    }
+    if ($bytes >= 1048576) {
+        return sprintf('%.2f MB', $bytes / 1048576);
+    }
+    if ($bytes >= 1024) {
+        return sprintf('%.1f KB', $bytes / 1024);
+    }
+    return (int) $bytes . ' B';
+}
+
+function db_sync_render_dump_form($creds, $host, $port)
+{
+    echo '<div style="font-family:Consolas,monospace;font-size:14px">';
+    echo '<p style="margin:0 0 6px">'
+        . '<button type="button" onclick="location.href=\'' . htmlspecialchars($_SERVER['PHP_SELF']) . '\'" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">HOME</button>'
+        . '</p>';
+
+    try {
+        $tables = db_sync_list_tables($creds, $host, $port);
+    } catch (Exception $e) {
+        echo '<p style="color:#c00">Nie moge pobrac listy tabel: ' . htmlspecialchars($e->getMessage()) . '</p>';
+        echo '</div>';
+        return;
+    }
+
+    $excluded = db_sync_exclude_load($creds['DB_NAME']);
+
+    echo '<h3 style="margin:4px 0 6px">Nowy dump bazy: ' . htmlspecialchars($creds['DB_NAME']) . ' (' . count($tables) . ' tabel)</h3>';
+    echo '<p style="margin:0 0 10px;color:#555">Zaznaczenie checkboxa = tabela <b>WYKLUCZONA</b> ze zrzutu w calosci (struktura i dane). Zaznaczanie dziala odwrotnie niz w phpMyAdmin: zaznaczone tabele sa pomijane.</p>';
+    echo '<form method="post" action="">'
+        . '<input type="hidden" name="action" value="dump">';
+    foreach (array('MYSQLDUMP', 'MYSQL') as $p) {
+        if (!empty($_GET[$p])) {
+            echo '<input type="hidden" name="' . $p . '" value="' . htmlspecialchars($_GET[$p]) . '">';
+        }
+    }
+    echo '<p style="margin:0 0 8px">'
+        . '<button type="button" onclick="var b=this.form.querySelectorAll(\'input[type=checkbox]\');for(var i=0;i<b.length;i++){b[i].checked=true;}" style="font-family:Consolas,monospace;font-size:13px;padding:4px 10px;cursor:pointer;background:#eee;border:1px solid #ccc;border-radius:4px;margin-right:6px">Zaznacz wszystkie</button>'
+        . '<button type="button" onclick="var b=this.form.querySelectorAll(\'input[type=checkbox]\');for(var i=0;i<b.length;i++){b[i].checked=false;}" style="font-family:Consolas,monospace;font-size:13px;padding:4px 10px;cursor:pointer;background:#eee;border:1px solid #ccc;border-radius:4px">Odznacz wszystkie</button>'
+        . '</p>'
+        . '<table style="border-collapse:collapse;margin:12px 0">'
+        . '<thead><tr style="background:#f2f2f2">'
+        . '<th style="border:1px solid #ddd;padding:4px 10px;text-align:left">#</th>'
+        . '<th style="border:1px solid #ddd;padding:4px 10px;text-align:left">Tabela</th>'
+        . '<th style="border:1px solid #ddd;padding:4px 10px;text-align:right">Rozmiar</th>'
+        . '<th style="border:1px solid #ddd;padding:4px 10px;text-align:center">Wyklucz ze zrzutu</th>'
+        . '</tr></thead><tbody>';
+    $i = 0;
+    foreach ($tables as $t => $size) {
+        $i++;
+        $checked  = in_array($t, $excluded) ? ' checked' : '';
+        $sizeHtml = db_sync_table_size_label($size);
+        $bold     = $size > 10 * 1048576 ? 'font-weight:bold;' : '';
+        $rowStyle = trim(($checked !== '' ? 'background:#ffe9e9;' : '') . $bold);
+        echo '<tr' . ($rowStyle !== '' ? ' style="' . $rowStyle . '"' : '') . '>'
+            . '<td style="border:1px solid #ddd;padding:4px 10px">' . $i . '</td>'
+            . '<td style="border:1px solid #ddd;padding:4px 10px">' . htmlspecialchars($t) . '</td>'
+            . '<td style="border:1px solid #ddd;padding:4px 10px;text-align:right">' . $sizeHtml . '</td>'
+            . '<td style="border:1px solid #ddd;padding:4px 10px;text-align:center"><input type="checkbox" name="exclude[]" value="' . htmlspecialchars($t) . '"' . $checked . '></td>'
+            . '</tr>';
+    }
+    echo '</tbody></table>'
+        . '<button type="submit" onclick="var n=this.form.querySelectorAll(\'input[type=checkbox]:checked\').length;return confirm(\'Wykonac dump?\nWykluczonych tabel: \' + n);" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#080;color:#fff;border:0;border-radius:4px">Wykonaj dump</button>'
         . '</form>';
     echo '</div>';
 }
@@ -405,9 +490,18 @@ function db_sync_find_binary($names, $candidates = array())
     return false;
 }
 
+function db_sync_get_param($key)
+{
+    $v = isset($_POST[$key]) ? trim($_POST[$key]) : '';
+    if ($v === '') {
+        $v = isset($_GET[$key]) ? trim($_GET[$key]) : '';
+    }
+    return $v;
+}
+
 function db_sync_probe($binary, $getParam)
 {
-    $bin = !empty($_GET[$getParam]) ? trim($_GET[$getParam]) : '';
+    $bin = db_sync_get_param($getParam);
     if ($bin === '') {
         $bin = db_sync_find_binary(array($binary, $binary . '.exe'), db_sync_binary_candidates($binary));
     }
@@ -432,14 +526,118 @@ function db_sync_probe($binary, $getParam)
 }
 
 /* ------------------------------------------------------------------ */
+/* Lista tabel i konfiguracja wykluczen                                */
+/* ------------------------------------------------------------------ */
+
+function db_sync_list_tables($creds, $host, $port)
+{
+    $mysql = db_sync_get_param('MYSQL');
+    if ($mysql === '') {
+        $mysql = db_sync_find_binary(array('mysql', 'mysql.exe'), db_sync_binary_candidates('mysql'));
+    }
+    if ($mysql === false) {
+        throw new Exception('Nie moge pobrac listy tabel (brak binarki mysql). Podaj sciezke recznie: ?MYSQL=/pelna/sciezka/mysql');
+    }
+
+    $sql = "SELECT table_name, IFNULL(data_length + index_length, 0) "
+        . "FROM information_schema.tables WHERE table_schema = '"
+        . str_replace("'", "''", $creds['DB_NAME']) . "' ORDER BY table_name";
+
+    $cmd = db_sync_bin_arg($mysql)
+        . db_sync_conn_args($host, $port)
+        . ' --user=' . escapeshellarg($creds['DB_USER'])
+        . ' --password=' . escapeshellarg($creds['DB_PASSWORD'])
+        . ' --database=' . escapeshellarg($creds['DB_NAME'])
+        . ' --connect-timeout=5 --skip-column-names --execute=' . escapeshellarg($sql)
+        . ' 2>&1';
+
+    db_sync_exec($cmd, $out, $code);
+    if ($code !== 0) {
+        throw new Exception('Nie moge pobrac listy tabel: ' . trim(implode("\n", $out)));
+    }
+
+    $tables = array();
+    foreach ($out as $line) {
+        $line = rtrim($line);
+        if ($line === '' || stripos($line, '[Warning]') !== false) {
+            continue;
+        }
+        $parts = explode("\t", $line);
+        $name  = $parts[0];
+        $size  = (isset($parts[1]) && is_numeric($parts[1])) ? (float) $parts[1] : 0;
+        $tables[$name] = $size;
+    }
+    return $tables;
+}
+
+function db_sync_exclude_path($dbName)
+{
+    return DB_SYNC_DIR . '/exclude-' . db_sync_safe_name($dbName) . '.json';
+}
+
+function db_sync_exclude_load($dbName)
+{
+    $path = db_sync_exclude_path($dbName);
+    $json = is_file($path) ? @file_get_contents($path) : false;
+    if ($json === false) {
+        return array();
+    }
+    $data = json_decode($json, true);
+    if (!is_array($data) || !isset($data['exclude']) || !is_array($data['exclude'])) {
+        return array();
+    }
+    return db_sync_clean_exclude_list($data['exclude']);
+}
+
+function db_sync_exclude_save($dbName, $exclude)
+{
+    if (!is_dir(DB_SYNC_DIR)) {
+        if (!@mkdir(DB_SYNC_DIR, 0755, true)) {
+            throw new Exception('Nie moge utworzyc katalogu ' . DB_SYNC_DIR);
+        }
+    }
+    $flags = defined('JSON_PRETTY_PRINT') ? (JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) : 0;
+    $path  = db_sync_exclude_path($dbName);
+    $json  = json_encode(array('db' => $dbName, 'exclude' => array_values($exclude)), $flags);
+    if (@file_put_contents($path, $json) === false) {
+        throw new Exception('Nie moge zapisac pliku wykluczen: ' . $path);
+    }
+    db_sync_log('WYKLUCZENIA ZAPISANE', basename($path));
+}
+
+function db_sync_clean_exclude_list($exclude)
+{
+    $out = array();
+    if (is_array($exclude)) {
+        foreach ($exclude as $t) {
+            $t = is_string($t) ? trim($t) : '';
+            if ($t !== '') {
+                $out[] = $t;
+            }
+        }
+    }
+    return array_values(array_unique($out));
+}
+
+function db_sync_filter_tables($creds, $host, $port, $exclude)
+{
+    if (empty($exclude)) {
+        return array();
+    }
+    try {
+        $tables = db_sync_list_tables($creds, $host, $port);
+    } catch (Exception $e) {
+        return $exclude;
+    }
+    return array_values(array_intersect($exclude, array_keys($tables)));
+}
+
+/* ------------------------------------------------------------------ */
 /* Dump                                                                */
 /* ------------------------------------------------------------------ */
 
-function db_sync_dump($creds, $host, $port)
+function db_sync_dump($creds, $host, $port, $exclude = array())
 {
-    $sqlFile = DB_SYNC_DIR . '/' . db_sync_dump_filename($creds['DB_NAME']);
-    db_sync_log('AKCJA', 'dump -> ' . $sqlFile);
-
     if (!is_dir(DB_SYNC_DIR)) {
         if (!@mkdir(DB_SYNC_DIR, 0755, true)) {
             throw new Exception('Nie moge utworzyc katalogu ' . DB_SYNC_DIR);
@@ -450,6 +648,17 @@ function db_sync_dump($creds, $host, $port)
         throw new Exception('Katalog ' . DB_SYNC_DIR . ' nie jest zapisywalny.');
     }
 
+    $exclude = db_sync_filter_tables($creds, $host, $port, $exclude);
+
+    $sqlFile = DB_SYNC_DIR . '/' . db_sync_dump_filename($creds['DB_NAME'], $exclude);
+    db_sync_log('AKCJA', 'dump -> ' . $sqlFile);
+
+    if (!empty($exclude)) {
+        db_sync_log('WYKLUCZONE TABELE', count($exclude) . ': ' . implode(', ', $exclude));
+    } else {
+        db_sync_log('WYKLUCZONE TABELE', 'brak (pelny dump)');
+    }
+
     $mysqldump = db_sync_probe('mysqldump', 'MYSQLDUMP');
 
     $cmd = db_sync_bin_arg($mysqldump)
@@ -458,8 +667,11 @@ function db_sync_dump($creds, $host, $port)
         . ' --password=' . escapeshellarg($creds['DB_PASSWORD'])
         . ' --single-transaction --quick --skip-lock-tables --no-tablespaces'
         . ' --default-character-set=utf8'
-        . ' --add-drop-table'
-        . ' --result-file=' . escapeshellarg($sqlFile)
+        . ' --add-drop-table';
+    foreach ($exclude as $table) {
+        $cmd .= ' --ignore-table=' . escapeshellarg($creds['DB_NAME'] . '.' . $table);
+    }
+    $cmd .= ' --result-file=' . escapeshellarg($sqlFile)
         . ' ' . escapeshellarg($creds['DB_NAME'])
         . ' 2>&1';
 
@@ -473,9 +685,24 @@ function db_sync_dump($creds, $host, $port)
         );
     }
 
+    if (!empty($exclude)) {
+        db_sync_prepend_comment($sqlFile, $creds['DB_NAME'], $exclude);
+    }
+
     $size = filesize($sqlFile);
     db_sync_log('DUMP GOTOWY', db_sync_human_size($size) . ' -> ' . $sqlFile);
     return $sqlFile;
+}
+
+function db_sync_prepend_comment($sqlFile, $dbName, $exclude)
+{
+    $comment = '-- _dbsync partial dump; baza: ' . $dbName
+        . '; wykluczone tabele: ' . implode(', ', $exclude) . "\n";
+    $content = @file_get_contents($sqlFile);
+    if ($content === false) {
+        return;
+    }
+    @file_put_contents($sqlFile, $comment . $content);
 }
 
 /* ------------------------------------------------------------------ */
@@ -630,6 +857,7 @@ if (!$authOk) {
 }
 
 $start = microtime(true);
+$showDumpForm = false;
 
 // pobranie dumpu - czysty plik, bez interfejsu (przed jakimkolwiek HTML)
 $pendingError = '';
@@ -649,7 +877,7 @@ $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset(
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
 $isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
 $serverColor = $isLocal ? '#e80' : '#ff0000';
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.1, 2026-08-28</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.3, 2026-09-02</b></div>' . "\n";
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | ' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . '</b></div>' . "\n";
 flush();
 
@@ -681,7 +909,15 @@ try {
     }
 
     if ($action === 'dump') {
-        db_sync_dump($creds, $host, $port);
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $exclude = isset($_POST['exclude']) ? $_POST['exclude'] : array();
+            $exclude = db_sync_clean_exclude_list($exclude);
+            $exclude = db_sync_filter_tables($creds, $host, $port, $exclude);
+            db_sync_exclude_save($creds['DB_NAME'], $exclude);
+            db_sync_dump($creds, $host, $port, $exclude);
+        } else {
+            $showDumpForm = true;
+        }
     } elseif ($action === 'sync') {
         $file  = isset($_GET['file']) ? trim($_GET['file']) : '';
         $files = isset($_POST['files']) && is_array($_POST['files']) ? $_POST['files'] : array();
@@ -713,4 +949,8 @@ db_sync_log('CZAS WYKONANIA', $elapsed . ' s');
 flush();
 
 // lista z przyciskami - widoczna zawsze pod logiem
-db_sync_render_list();
+if ($showDumpForm) {
+    db_sync_render_dump_form($creds, $host, $port);
+} else {
+    db_sync_render_list();
+}
