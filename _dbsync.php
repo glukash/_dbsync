@@ -203,18 +203,47 @@ function db_sync_safe_name($name)
     return preg_replace('/[^A-Za-z0-9_-]/', '_', $name);
 }
 
-function db_sync_dump_filename($dbName, $exclude = array())
+function db_sync_common_prefix($names)
+{
+    $names = array_values(array_filter(array_map('strval', $names)));
+    if (count($names) < 2) {
+        return '';
+    }
+    $prefix = $names[0];
+    foreach (array_slice($names, 1) as $n) {
+        while (substr($n, 0, strlen($prefix)) !== $prefix) {
+            $prefix = substr($prefix, 0, -1);
+            if ($prefix === '') {
+                return '';
+            }
+        }
+    }
+    // ucina tylko gdy prefiks ma co najmniej 2 znaki, inaczej brak oszczednosci
+    if (strlen($prefix) < 2) {
+        return '';
+    }
+    return $prefix;
+}
+
+function db_sync_dump_filename($dbName, $exclude = array(), $prefix = '')
 {
     $name = db_sync_safe_name($dbName);
     $suffix = '';
     if (!empty($exclude)) {
         $shown = array();
-        foreach (array_slice($exclude, 0, 4) as $t) {
-            $shown[] = db_sync_safe_name($t);
+        foreach (array_slice($exclude, 0, 5) as $t) {
+            $short = $t;
+            if ($prefix !== '' && stripos($t, $prefix) === 0) {
+                $short = substr($t, strlen($prefix));
+                if ($short === '') {
+                    $short = $t;
+                }
+            }
+            $shown[] = db_sync_safe_name($short);
         }
         $suffix = implode('__', $shown);
-        if (count($exclude) > 4) {
-            $suffix .= '__+' . (count($exclude) - 4) . ' wiecej';
+        if (count($exclude) > 5) {
+            $suffix .= '__+' . (count($exclude) - 5) . ' wiecej';
         }
         $suffix = '_EXCLUDE[' . $suffix . ']';
     }
@@ -648,9 +677,18 @@ function db_sync_dump($creds, $host, $port, $exclude = array())
         throw new Exception('Katalog ' . DB_SYNC_DIR . ' nie jest zapisywalny.');
     }
 
-    $exclude = db_sync_filter_tables($creds, $host, $port, $exclude);
+    $prefix = '';
+    if (!empty($exclude)) {
+        try {
+            $allTables = db_sync_list_tables($creds, $host, $port);
+            $exclude = array_values(array_intersect($exclude, array_keys($allTables)));
+            $prefix  = db_sync_common_prefix(array_keys($allTables));
+        } catch (Exception $e) {
+            // lista niedostepna - zostaw wykluczenia bez filtrowania
+        }
+    }
 
-    $sqlFile = DB_SYNC_DIR . '/' . db_sync_dump_filename($creds['DB_NAME'], $exclude);
+    $sqlFile = DB_SYNC_DIR . '/' . db_sync_dump_filename($creds['DB_NAME'], $exclude, $prefix);
     db_sync_log('AKCJA', 'dump -> ' . $sqlFile);
 
     if (!empty($exclude)) {
@@ -897,7 +935,7 @@ $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset(
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
 $isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
 $serverColor = $isLocal ? '#e80' : '#ff0000';
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.6, 2026-09-02</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.7, 2026-09-02</b></div>' . "\n";
 $httpHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'nieznany';
 $cwd      = function_exists('getcwd') ? getcwd() : 'nieznany';
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . ' | SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | DOMENA: ' . htmlspecialchars($httpHost) . ' | KATALOG: ' . htmlspecialchars($cwd) . '</b></div>' . "\n";
