@@ -78,7 +78,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_VERSION', '1.0.13');
+define('DBSYNC_VERSION', '1.0.14');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -969,11 +969,32 @@ function db_sync_apply_update($body)
     if (@file_put_contents($tmp, $body) === false) {
         throw new Exception('Nie moge zapisac pliku tymczasowego: ' . $tmp);
     }
-    if (!@rename($tmp, $target)) {
-        @unlink($tmp);
-        throw new Exception('Nie moge zastapic pliku: ' . $target);
+    // Windows: rename() nad istniejacym plikiem moze sie nie udac, gdy plik
+    // jest w tym momencie otwarty przez inny proces (drugie zadanie php-cgi,
+    // antywirus) - wtedy probujemy ponownie i nadpisujemy w miejscu (copy/
+    // file_put_contents), ktore nie wymaga prawa do kasowania pliku.
+    for ($i = 0; $i < 5; $i++) {
+        if (@rename($tmp, $target)) {
+            return true;
+        }
+        usleep(250000);
     }
-    return true;
+    for ($i = 0; $i < 5; $i++) {
+        if (@copy($tmp, $target)) {
+            @unlink($tmp);
+            return true;
+        }
+        usleep(250000);
+    }
+    for ($i = 0; $i < 5; $i++) {
+        if (@file_put_contents($target, $body) !== false) {
+            @unlink($tmp);
+            return true;
+        }
+        usleep(250000);
+    }
+    @unlink($tmp);
+    throw new Exception('Nie moge zastapic pliku: ' . $target . ' (plik zablokowany? zamknij dodatkowe karty z _dbsync.php i sprobuj ponownie)');
 }
 
 /* ------------------------------------------------------------------ */
