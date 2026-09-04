@@ -14,6 +14,8 @@
  *   _dbsync.php?action=download&file=NAZWA -> pobranie pliku dumpu
  *   _dbsync.php?action=sync&file=NAZWA    -> wczytanie pliku do bazy
  *   _dbsync.php?action=delete (POST files[]) -> usuniecie zaznaczonych plikow
+ *   _dbsync.php?action=checkupdate    -> sprawdzenie nowszej wersji na GitHubie
+ *   _dbsync.php?action=update         -> pobranie i zainstalowanie nowszej wersji
  *
  * Dane dostepowe do bazy (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) sa
  * czytane po kolei z:
@@ -73,6 +75,12 @@ define('DB_SYNC_DIR',  __DIR__ . '/_dbsync');
 /*   php -r "echo password_hash('TwojeHaslo', PASSWORD_DEFAULT);" */
 define('DBSYNC_AUTH_LOGIN', 'dbsync');
 define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj.BoefhHlyb9ee');
+
+/* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
+/* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
+define('DBSYNC_VERSION', '1.0.12');
+define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
+define('DBSYNC_GITHUB_BRANCH', 'main');
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -333,6 +341,7 @@ function db_sync_render_list()
     echo '<p style="margin:0 0 6px;display:flex;gap:10px;align-items:center">'
         . '<button type="button" onclick="location.href=\'' . htmlspecialchars($_SERVER['PHP_SELF']) . '\'" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">HOME</button>'
         . '<a href="' . htmlspecialchars($_SERVER['PHP_SELF']) . '?logout" style="font-family:Consolas,monospace;font-size:13px;color:#036">[wyloguj]</a>'
+        . '<a href="' . htmlspecialchars($_SERVER['PHP_SELF']) . '?action=checkupdate" style="font-family:Consolas,monospace;font-size:13px;color:#080;font-weight:bold">[sprawdz aktualizacje]</a>'
         . '</p>';
     echo '<h3 style="margin:4px 0 6px">Pliki dumpu bazy (' . count($files) . ')</h3>';
     if (empty($files)) {
@@ -853,6 +862,121 @@ function db_sync_delete($files)
 }
 
 /* ------------------------------------------------------------------ */
+/* Aktualizacje (GitHub)                                               */
+/* ------------------------------------------------------------------ */
+
+define('DBSYNC_GITHUB_TAGS_URL', 'https://api.github.com/repos/' . DBSYNC_GITHUB_REPO . '/tags?per_page=20');
+define('DBSYNC_GITHUB_RAW_URL', 'https://raw.githubusercontent.com/' . DBSYNC_GITHUB_REPO . '/' . DBSYNC_GITHUB_BRANCH . '/_dbsync.php');
+
+function db_sync_http_get($url, $timeout = 10)
+{
+    // 1) curl (najczesciej dostepny na hostingach)
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, array(
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_USERAGENT => '_dbsync/' . DBSYNC_VERSION,
+            CURLOPT_HTTPHEADER => array('Accept: application/vnd.github+json'),
+        ));
+        $body = curl_exec($ch);
+        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        if ($body !== false && $httpCode === 200) {
+            return $body;
+        }
+        throw new Exception('curl: ' . ($err !== '' ? $err : 'HTTP ' . $httpCode));
+    }
+    // 2) file_get_contents (wymaga allow_url_fopen=On)
+    if ((bool) ini_get('allow_url_fopen')) {
+        $ctx = stream_context_create(array(
+            'http' => array(
+                'method' => 'GET',
+                'timeout' => $timeout,
+                'ignore_errors' => true,
+                'header' => 'User-Agent: _dbsync/' . DBSYNC_VERSION
+                    . "\r\nAccept: application/vnd.github+json\r\n",
+            ),
+            'ssl' => array('verify_peer' => true, 'verify_peer_name' => true),
+        ));
+        $body = @file_get_contents($url, false, $ctx);
+        if ($body !== false) {
+            return $body;
+        }
+    }
+    throw new Exception('Brak mozliwosci pobrania danych z sieci (curl wylaczony i allow_url_fopen=Off).');
+}
+
+function db_sync_normalize_version($tag)
+{
+    $v = trim((string) $tag);
+    $v = preg_replace('/^[vV]\s*/', '', $v);
+    return $v;
+}
+
+function db_sync_github_latest_tag()
+{
+    $json = db_sync_http_get(DBSYNC_GITHUB_TAGS_URL);
+    $data = json_decode($json, true);
+    if (!is_array($data)) {
+        throw new Exception('Nie udalo sie sparsowac odpowiedzi GitHub API.');
+    }
+    if (isset($data['message'])) {
+        throw new Exception('GitHub API: ' . $data['message']);
+    }
+    $tags = array();
+    foreach ($data as $item) {
+        if (!is_array($item) || !isset($item['name'])) {
+            continue;
+        }
+        $v = db_sync_normalize_version($item['name']);
+        if ($v !== '' && preg_match('/^\d+(\.\d+)*([.-][A-Za-z0-9.]+)?$/', $v)) {
+            $tags[] = $v;
+        }
+    }
+    if (empty($tags)) {
+        throw new Exception('Na GitHubie nie znaleziono tagow z wersja (np. v1.0.12).');
+    }
+    usort($tags, 'version_compare');
+    return end($tags);
+}
+
+function db_sync_remote_script()
+{
+    $body = db_sync_http_get(DBSYNC_GITHUB_RAW_URL);
+    if (stripos(ltrim($body), '<?php') !== 0) {
+        throw new Exception('Pobrany plik nie zaczyna sie od <?php - to nie jest skrypt _dbsync.php.');
+    }
+    return $body;
+}
+
+function db_sync_remote_version($body)
+{
+    if (preg_match("/define\s*\(\s*'DBSYNC_VERSION'\s*,\s*'([^']+)'\s*\)/", $body, $m)) {
+        return $m[1];
+    }
+    return '';
+}
+
+function db_sync_apply_update($body)
+{
+    $target = __FILE__;
+    $tmp = $target . '.tmp';
+    if (@file_put_contents($tmp, $body) === false) {
+        throw new Exception('Nie moge zapisac pliku tymczasowego: ' . $tmp);
+    }
+    if (!@rename($tmp, $target)) {
+        @unlink($tmp);
+        throw new Exception('Nie moge zastapic pliku: ' . $target);
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* Autentykacja                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -935,7 +1059,7 @@ $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset(
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
 $isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
 $serverColor = $isLocal ? '#e80' : '#ff0000';
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: 1.0.11, 2026-09-02</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: ' . DBSYNC_VERSION . ', 2026-09-04</b></div>' . "\n";
 $httpHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'nieznany';
 $cwd      = function_exists('getcwd') ? getcwd() : 'nieznany';
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . ' | SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | DOMENA: ' . htmlspecialchars($httpHost) . ' | KATALOG: ' . htmlspecialchars($cwd) . '</b></div>' . "\n";
@@ -996,6 +1120,30 @@ try {
     } elseif ($action === 'delete') {
         $files = isset($_POST['files']) && is_array($_POST['files']) ? $_POST['files'] : array();
         db_sync_delete($files);
+    } elseif ($action === 'checkupdate') {
+        $latest = db_sync_github_latest_tag();
+        if (version_compare($latest, DBSYNC_VERSION, '>')) {
+            db_sync_log('AKTUALIZACJA', 'Dostepna nowsza wersja: ' . $latest . ' (obecna: ' . DBSYNC_VERSION . ')');
+            $updUrl = htmlspecialchars($_SERVER['PHP_SELF']) . '?action=update';
+            echo '<div style="font-family:Consolas,monospace;font-size:14px;padding:10px 14px;margin:8px 0;border:1px solid #0a0;background:#eaffea;border-radius:4px">'
+                . '<b>Dostepna aktualizacja do wersji ' . htmlspecialchars($latest) . '</b> '
+                . '<a href="' . $updUrl . '" onclick="return confirm(\'Pobrac i zainstalowac wersje ' . htmlspecialchars($latest) . '?\\nObecny plik zostanie ZASTAPIONY bez kopii zapasowej.\\n\')" '
+                . 'style="font-family:Consolas,monospace;font-size:13px;padding:6px 14px;background:#080;color:#fff;border:0;border-radius:4px;text-decoration:none;cursor:pointer">[UPDATE]</a>'
+                . '</div>' . "\n";
+        } else {
+            db_sync_log('AKTUALIZACJA', 'Brak nowszej wersji (najnowsza na GitHubie: ' . $latest . ', obecna: ' . DBSYNC_VERSION . ')');
+        }
+    } elseif ($action === 'update') {
+        $body = db_sync_remote_script();
+        $newVersion = db_sync_remote_version($body);
+        if ($newVersion === '') {
+            throw new Exception('Pobrany plik nie zawiera stalej DBSYNC_VERSION - nie podmieniam.');
+        }
+        if (version_compare($newVersion, DBSYNC_VERSION, '<')) {
+            throw new Exception('Pobrana wersja ' . $newVersion . ' jest starsza niz zainstalowana ' . DBSYNC_VERSION . ' - nie podmieniam.');
+        }
+        db_sync_apply_update($body);
+        db_sync_log('AKTUALIZACJA', 'Zainstalowano wersje ' . $newVersion . ' - odswiez strone (F5).');
     }
 } catch (Exception $e) {
     db_sync_log('WYJATEK', $e->getMessage(), true);
