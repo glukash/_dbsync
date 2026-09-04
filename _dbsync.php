@@ -78,7 +78,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_VERSION', '1.0.14');
+define('DBSYNC_VERSION', '1.0.15');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -962,6 +962,21 @@ function db_sync_remote_version($body)
     return '';
 }
 
+function db_sync_opcache_clear($target)
+{
+    // OPcache moze serwowac stara skompilowana wersje mimo zmiany pliku na
+    // dysku (szczegolnie przy opcache.validate_timestamps=0). Na produkcji nie
+    // da sie restarcic Apache, wiec czyscimy cache z poziomu PHP (tam gdzie
+    // to mozliwe - php-cgi/fpm z wlaczonym opcache).
+    if (function_exists('opcache_reset')) {
+        @opcache_reset();
+    }
+    if (function_exists('opcache_invalidate')) {
+        @opcache_invalidate($target, true);
+        @opcache_invalidate($target . '.tmp', true);
+    }
+}
+
 function db_sync_apply_update($body)
 {
     $target = __FILE__;
@@ -975,6 +990,7 @@ function db_sync_apply_update($body)
     // file_put_contents), ktore nie wymaga prawa do kasowania pliku.
     for ($i = 0; $i < 5; $i++) {
         if (@rename($tmp, $target)) {
+            db_sync_opcache_clear($target);
             return true;
         }
         usleep(250000);
@@ -982,6 +998,7 @@ function db_sync_apply_update($body)
     for ($i = 0; $i < 5; $i++) {
         if (@copy($tmp, $target)) {
             @unlink($tmp);
+            db_sync_opcache_clear($target);
             return true;
         }
         usleep(250000);
@@ -989,6 +1006,7 @@ function db_sync_apply_update($body)
     for ($i = 0; $i < 5; $i++) {
         if (@file_put_contents($target, $body) !== false) {
             @unlink($tmp);
+            db_sync_opcache_clear($target);
             return true;
         }
         usleep(250000);
