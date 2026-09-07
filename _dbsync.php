@@ -20,7 +20,8 @@
  * Dane dostepowe do bazy (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) sa
  * czytane po kolei z:
  *   - wp-config.php (WordPress) - jesli istnieje
- *   - app/config/parameters.php (PrestaShop) - jesli nie ma wp-config.php
+ *   - app/config/parameters.php (PrestaShop 1.7+) - jesli nie ma wp-config.php
+ *   - config/settings.inc.php (PrestaShop 1.6) - jesli nie ma powyzszych
  * Do zrzutu uzywana jest binarka mysqldump,
  * do importu binarka mysql. Jesli binarki nie sa w PATH, sciezke mozna
  * podac recznie:
@@ -78,7 +79,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_VERSION', '1.0.15');
+define('DBSYNC_DATE', '2026-09-07');
+define('DBSYNC_VERSION', '1.1.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -180,6 +182,32 @@ function db_sync_parse_ps_config($path)
     return $creds;
 }
 
+function db_sync_parse_ps16_config($path)
+{
+    $keys = array(
+        '_DB_SERVER_' => 'DB_HOST',
+        '_DB_NAME_'   => 'DB_NAME',
+        '_DB_USER_'   => 'DB_USER',
+        '_DB_PASSWD_' => 'DB_PASSWORD',
+    );
+    $creds = array('DB_NAME' => '', 'DB_USER' => '', 'DB_PASSWORD' => '', 'DB_HOST' => '');
+    $lines = @file($path);
+    if ($lines === false) {
+        throw new Exception('Nie moge odczytac pliku settings.inc.php: ' . $path);
+    }
+    foreach ($lines as $line) {
+        foreach ($keys as $const => $outKey) {
+            if (stripos($line, $const) === false) {
+                continue;
+            }
+            if (preg_match("/define\(\s*['\"]" . preg_quote($const, '/') . "['\"]\s*,\s*['\"]([^'\"]*)['\"]\s*\)/i", $line, $m)) {
+                $creds[$outKey] = $m[1];
+            }
+        }
+    }
+    return $creds;
+}
+
 function db_sync_creds_from_disk()
 {
     $wp = __DIR__ . '/wp-config.php';
@@ -188,9 +216,13 @@ function db_sync_creds_from_disk()
     }
     $ps = __DIR__ . '/app/config/parameters.php';
     if (is_file($ps)) {
-        return array('source' => 'app/config/parameters.php (PrestaShop)', 'creds' => db_sync_parse_ps_config($ps));
+        return array('source' => 'app/config/parameters.php (PrestaShop 1.7+)', 'creds' => db_sync_parse_ps_config($ps));
     }
-    throw new Exception('Nie znaleziono konfiguracji bazy danych (wp-config.php ani app/config/parameters.php).');
+    $ps16 = __DIR__ . '/config/settings.inc.php';
+    if (is_file($ps16)) {
+        return array('source' => 'config/settings.inc.php (PrestaShop 1.6)', 'creds' => db_sync_parse_ps16_config($ps16));
+    }
+    throw new Exception('Nie znaleziono konfiguracji bazy danych (wp-config.php, app/config/parameters.php ani config/settings.inc.php).');
 }
 
 function db_sync_host_port($host)
@@ -1098,7 +1130,7 @@ $serverIp   = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : (isset(
 $serverName = function_exists('gethostname') ? gethostname() : php_uname('n');
 $isLocal    = ($serverIp === '127.0.0.1' || $serverIp === '::1' || $serverIp === 'localhost');
 $serverColor = $isLocal ? '#e80' : '#ff0000';
-echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: ' . DBSYNC_VERSION . ', 2026-09-04</b></div>' . "\n";
+echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b>_DBSYNC VER: ' . DBSYNC_VERSION . ', ' . DBSYNC_DATE . '</b></div>' . "\n";
 $httpHost = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'nieznany';
 $cwd      = function_exists('getcwd') ? getcwd() : 'nieznany';
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . ' | SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | DOMENA: ' . htmlspecialchars($httpHost) . ' | KATALOG: ' . htmlspecialchars($cwd) . '</b></div>' . "\n";
