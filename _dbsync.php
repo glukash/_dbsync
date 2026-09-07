@@ -80,7 +80,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
 define('DBSYNC_DATE', '2026-09-07');
-define('DBSYNC_VERSION', '1.1.0');
+define('DBSYNC_VERSION', '1.1.1');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -1136,6 +1136,10 @@ $cwd      = function_exists('getcwd') ? getcwd() : 'nieznany';
 echo '<div style="font-family:Consolas,monospace;font-size:14px;line-height:1.55"><b style="color:' . $serverColor . '">' . ($isLocal ? 'LOKALNY' : 'PRODUKCJA!') . ' | SERWER: ' . htmlspecialchars($serverName) . ' | IP: ' . htmlspecialchars($serverIp) . ' | DOMENA: ' . htmlspecialchars($httpHost) . ' | KATALOG: ' . htmlspecialchars($cwd) . '</b></div>' . "\n";
 flush();
 
+$creds = array('DB_NAME' => '', 'DB_USER' => '', 'DB_PASSWORD' => '', 'DB_HOST' => '');
+$host  = '';
+$port  = '';
+
 try {
     $action = isset($_POST['action']) ? $_POST['action'] : (isset($_GET['action']) ? $_GET['action'] : '');
     $action = strtolower(trim($action));
@@ -1144,19 +1148,27 @@ try {
         throw new Exception($pendingError);
     }
 
-    $dbConfig = db_sync_creds_from_disk();
-    $creds = $dbConfig['creds'];
+    // checkupdate/update nie wymagaja konfiguracji bazy - musza dzialac,
+    // nawet gdy na serwerze nie znaleziono wp-config.php/parameters.php,
+    // zeby zawsze mozna bylo zaktualizowac skrypt do wersji, ktora np.
+    // dodaje obsluge kolejnego formatu konfiguracji.
+    $needsDbConfig = ($action !== 'checkupdate' && $action !== 'update');
 
-    db_sync_log('KONFIGURACJA', 'odczytano z ' . $dbConfig['source']);
-    list($host, $port) = db_sync_host_port($creds['DB_HOST']);
+    if ($needsDbConfig) {
+        $dbConfig = db_sync_creds_from_disk();
+        $creds = $dbConfig['creds'];
 
-    db_sync_log('KONFIGURACJA', db_sync_creds_summary($creds));
+        db_sync_log('KONFIGURACJA', 'odczytano z ' . $dbConfig['source']);
+        list($host, $port) = db_sync_host_port($creds['DB_HOST']);
 
-    $conn = db_sync_test_connection($creds, $host, $port);
-    if ($conn === true) {
-        db_sync_log('POLACZENIE Z BAZA', 'OK (' . $creds['DB_NAME'] . ')');
-    } else {
-        db_sync_log('POLACZENIE Z BAZA', $conn, true);
+        db_sync_log('KONFIGURACJA', db_sync_creds_summary($creds));
+
+        $conn = db_sync_test_connection($creds, $host, $port);
+        if ($conn === true) {
+            db_sync_log('POLACZENIE Z BAZA', 'OK (' . $creds['DB_NAME'] . ')');
+        } else {
+            db_sync_log('POLACZENIE Z BAZA', $conn, true);
+        }
     }
 
     if (($action === 'dump' || $action === 'sync') && ($creds['DB_NAME'] === '' || $creds['DB_USER'] === '')) {
