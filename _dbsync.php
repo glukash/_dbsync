@@ -79,8 +79,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_DATE', '2026-09-07');
-define('DBSYNC_VERSION', '1.1.1');
+define('DBSYNC_DATE', '2026-09-08');
+define('DBSYNC_VERSION', '1.1.2');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -629,12 +629,15 @@ function db_sync_list_tables($creds, $host, $port)
     $tables = array();
     foreach ($out as $line) {
         $line = rtrim($line);
-        if ($line === '' || stripos($line, '[Warning]') !== false) {
+        if ($line === '') {
             continue;
         }
-        $parts = explode("\t", $line);
-        $name  = $parts[0];
-        $size  = (isset($parts[1]) && is_numeric($parts[1])) ? (float) $parts[1] : 0;
+        $parts = explode("\t", $line, 2);
+        if (count($parts) !== 2 || $parts[0] === '' || !preg_match('/^\d+(?:\.\d+)?$/', $parts[1])) {
+            continue;
+        }
+        $name = $parts[0];
+        $size = (float) $parts[1];
         $tables[$name] = $size;
     }
     return $tables;
