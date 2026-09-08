@@ -80,7 +80,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
 define('DBSYNC_DATE', '2026-09-08');
-define('DBSYNC_VERSION', '1.1.2');
+define('DBSYNC_VERSION', '1.2.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -353,6 +353,14 @@ function db_sync_test_connection($creds, $host, $port)
     return true;
 }
 
+function db_sync_site_url()
+{
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443) ? 'https' : 'http';
+    $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost';
+    $dir = rtrim(str_replace('\\', '/', dirname($_SERVER['PHP_SELF'])), '/') . '/';
+    return $scheme . '://' . $host . $dir;
+}
+
 function db_sync_list_files()
 {
     $files = array();
@@ -372,6 +380,7 @@ function db_sync_render_list()
     echo '<div style="font-family:Consolas,monospace;font-size:14px">';
     echo '<p style="margin:0 0 6px;display:flex;gap:10px;align-items:center">'
         . '<button type="button" onclick="location.href=\'' . htmlspecialchars($_SERVER['PHP_SELF']) . '\'" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">HOME</button>'
+        . '<button type="button" onclick="window.open(\'' . htmlspecialchars(db_sync_site_url()) . '\',\'_blank\')" title="Otworz serwis" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">-&gt;</button>'
         . '<a href="' . htmlspecialchars($_SERVER['PHP_SELF']) . '?logout" style="font-family:Consolas,monospace;font-size:13px;color:#036">[wyloguj]</a>'
         . '<a href="' . htmlspecialchars($_SERVER['PHP_SELF']) . '?action=checkupdate" style="font-family:Consolas,monospace;font-size:13px;color:#080;font-weight:bold">[sprawdz aktualizacje]</a>'
         . '</p>';
@@ -419,8 +428,9 @@ function db_sync_table_size_label($bytes)
 function db_sync_render_dump_form($creds, $host, $port)
 {
     echo '<div style="font-family:Consolas,monospace;font-size:14px">';
-    echo '<p style="margin:0 0 6px">'
+    echo '<p style="margin:0 0 6px;display:flex;gap:10px;align-items:center">'
         . '<button type="button" onclick="location.href=\'' . htmlspecialchars($_SERVER['PHP_SELF']) . '\'" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">HOME</button>'
+        . '<button type="button" onclick="window.open(\'' . htmlspecialchars(db_sync_site_url()) . '\',\'_blank\')" title="Otworz serwis" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">-&gt;</button>'
         . '</p>';
 
     try {
