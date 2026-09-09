@@ -79,8 +79,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_DATE', '2026-09-08');
-define('DBSYNC_VERSION', '1.2.0');
+define('DBSYNC_DATE', '2026-09-09');
+define('DBSYNC_VERSION', '1.2.1');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -452,7 +452,10 @@ function db_sync_render_dump_form($creds, $host, $port)
             echo '<input type="hidden" name="' . $p . '" value="' . htmlspecialchars($_GET[$p]) . '">';
         }
     }
-    echo '<p style="margin:0 0 8px">'
+    echo '<p style="margin:0 0 12px">'
+        . '<button type="submit" onclick="var n=this.form.querySelectorAll(\'input[type=checkbox]:checked\').length;return confirm(\'Wykonac dump?\nWykluczonych tabel: \' + n);" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#080;color:#fff;border:0;border-radius:4px">Wykonaj dump</button>'
+        . '</p>'
+        . '<p style="margin:0 0 8px">'
         . '<button type="button" onclick="var b=this.form.querySelectorAll(\'input[type=checkbox]\');for(var i=0;i<b.length;i++){b[i].checked=true;}" style="font-family:Consolas,monospace;font-size:13px;padding:4px 10px;cursor:pointer;background:#eee;border:1px solid #ccc;border-radius:4px;margin-right:6px">Zaznacz wszystkie</button>'
         . '<button type="button" onclick="var b=this.form.querySelectorAll(\'input[type=checkbox]\');for(var i=0;i<b.length;i++){b[i].checked=false;}" style="font-family:Consolas,monospace;font-size:13px;padding:4px 10px;cursor:pointer;background:#eee;border:1px solid #ccc;border-radius:4px">Odznacz wszystkie</button>'
         . '</p>'
