@@ -79,8 +79,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_DATE', '2026-09-09');
-define('DBSYNC_VERSION', '1.2.1');
+define('DBSYNC_DATE', '2026-09-15');
+define('DBSYNC_VERSION', '1.2.2');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -399,13 +399,13 @@ function db_sync_render_list()
                 . ' <small style="color:#888">(' . $size . ')</small></li>';
         }
         echo '</ul>'
-            . '<button type="submit" name="action" value="sync" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#036;color:#fff;border:0;border-radius:4px;margin-top:10px;margin-right:6px" onclick="var c=this.form.querySelectorAll(\'input[type=checkbox]:checked\');if(!c.length){alert(\'Zaznacz pliki do synchronizacji\');return false;}if(c.length>1){alert(\'Do synchronizacji mozesz zaznaczyc tylko JEDEN plik (zaznaczono \'+c.length+\')\');return false;}return confirm(\'Synchronizowac zaznaczony plik do bazy?\')">SYNC</button>'
+            . '<button type="submit" name="action" value="sync" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#009eaf;color:#fff;border:0;border-radius:4px;margin-top:10px;margin-right:6px" onclick="var c=this.form.querySelectorAll(\'input[type=checkbox]:checked\');if(!c.length){alert(\'Zaznacz pliki do synchronizacji\');return false;}if(c.length>1){alert(\'Do synchronizacji mozesz zaznaczyc tylko JEDEN plik (zaznaczono \'+c.length+\')\');return false;}return confirm(\'Synchronizowac zaznaczony plik do bazy?\')">SYNC</button>'
             . '<button type="submit" name="action" value="delete" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#c00;color:#fff;border:0;border-radius:4px;margin-top:10px" onclick="var c=this.form.querySelectorAll(\'input[type=checkbox]:checked\');if(!c.length){alert(\'Zaznacz pliki do usuniecia\');return false;}return confirm(\'Usunac zaznaczone pliki dumpu?\')">Usun zaznaczone</button>'
             . '</form>';
     }
     echo '<form method="get" action="" style="margin:14px 0 0">'
         . '<input type="hidden" name="action" value="dump">'
-        . '<button type="submit" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#080;color:#fff;border:0;border-radius:4px">Generuj nowy dump bazy</button>'
+        . '<button type="submit" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#af0090;color:#fff;border:0;border-radius:4px">Generuj nowy dump bazy</button>'
         . '</form>';
     echo '</div>';
 }
