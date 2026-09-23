@@ -25,6 +25,7 @@
  * Nazwa archiwum: YYMMDD-HHMMSS-{domena}.{ext}, np. 260923-103115-example.com.zip
  * (domena z zadania HTTP; przy braku - awaryjnie nazwa bazy).
  *   _dbsync.php?action=checkupdate    -> sprawdzenie nowszej wersji na GitHubie
+ *                                        (raw.githubusercontent.com, branch main)
  *   _dbsync.php?action=update         -> pobranie i zainstalowanie nowszej wersji
  *
  * Dane dostepowe do bazy (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) sa
@@ -113,9 +114,9 @@ define('DBSYNC_AUTH_LOGIN', 'dbsync');
 define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj.BoefhHlyb9ee');
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
-/* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
+/* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.6.0');
+define('DBSYNC_VERSION', '1.7.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -2111,7 +2112,10 @@ function db_sync_delete_archives($files)
 /* Aktualizacje (GitHub)                                               */
 /* ------------------------------------------------------------------ */
 
-define('DBSYNC_GITHUB_TAGS_URL', 'https://api.github.com/repos/' . DBSYNC_GITHUB_REPO . '/tags?per_page=20');
+/* Sprawdzanie wersji i pobieranie pliku korzystaja z tego samego zrodla -
+   surowego pliku z brancha main. Nie uzywamy api.github.com: limit 60
+   zapytan/h liczy sie per IP i na hostingu wspoldzielonym (np.
+   s124.cyber-folks.pl) konczyl sie bledem HTTP 403 przy checkupdate. */
 define('DBSYNC_GITHUB_RAW_URL', 'https://raw.githubusercontent.com/' . DBSYNC_GITHUB_REPO . '/' . DBSYNC_GITHUB_BRANCH . '/_dbsync.php');
 
 function db_sync_http_get($url, $timeout = 10)
@@ -2119,6 +2123,7 @@ function db_sync_http_get($url, $timeout = 10)
     // 1) curl (najczesciej dostepny na hostingach)
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
+        $headers = array();
         curl_setopt_array($ch, array(
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
@@ -2126,7 +2131,14 @@ function db_sync_http_get($url, $timeout = 10)
             CURLOPT_TIMEOUT => $timeout,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_USERAGENT => '_dbsync/' . DBSYNC_VERSION,
-            CURLOPT_HTTPHEADER => array('Accept: application/vnd.github+json'),
+            CURLOPT_HTTPHEADER => array('Accept: text/plain'),
+            CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$headers) {
+                $pos = strpos($line, ':');
+                if ($pos !== false) {
+                    $headers[strtolower(trim(substr($line, 0, $pos)))] = trim(substr($line, $pos + 1));
+                }
+                return strlen($line);
+            },
         ));
         $body = curl_exec($ch);
         $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -2135,7 +2147,7 @@ function db_sync_http_get($url, $timeout = 10)
         if ($body !== false && $httpCode === 200) {
             return $body;
         }
-        throw new Exception('curl: ' . ($err !== '' ? $err : 'HTTP ' . $httpCode));
+        throw new Exception('curl: ' . db_sync_http_error_detail($err, $httpCode, $body, $headers));
     }
     // 2) file_get_contents (wymaga allow_url_fopen=On)
     if ((bool) ini_get('allow_url_fopen')) {
@@ -2145,59 +2157,86 @@ function db_sync_http_get($url, $timeout = 10)
                 'timeout' => $timeout,
                 'ignore_errors' => true,
                 'header' => 'User-Agent: _dbsync/' . DBSYNC_VERSION
-                    . "\r\nAccept: application/vnd.github+json\r\n",
+                    . "\r\nAccept: text/plain\r\n",
             ),
             'ssl' => array('verify_peer' => true, 'verify_peer_name' => true),
         ));
-        $body = @file_get_contents($url, false, $ctx);
-        if ($body !== false) {
+        $body     = @file_get_contents($url, false, $ctx);
+        $httpCode = 0;
+        $headers  = array();
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $line) {
+                if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $m)) {
+                    $httpCode = (int) $m[1];
+                    $headers  = array(); // przy przekierowaniu przychodzi nowy blok naglowkow
+                } elseif (($pos = strpos($line, ':')) !== false) {
+                    $headers[strtolower(trim(substr($line, 0, $pos)))] = trim(substr($line, $pos + 1));
+                }
+            }
+        }
+        if ($body !== false && ($httpCode === 0 || $httpCode === 200)) {
             return $body;
         }
+        if ($body === false && $httpCode === 0) {
+            throw new Exception('Brak mozliwosci pobrania danych z sieci (curl wylaczony, a file_get_contents nie zwrocil danych).');
+        }
+        throw new Exception('file_get_contents: ' . db_sync_http_error_detail('', $httpCode, $body, $headers));
     }
     throw new Exception('Brak mozliwosci pobrania danych z sieci (curl wylaczony i allow_url_fopen=Off).');
 }
 
-function db_sync_normalize_version($tag)
+/* Czytelny opis bledu HTTP: kod, wybrane naglowki (limity GitHub) i skrot tresci. */
+function db_sync_http_error_detail($err, $httpCode, $body, $headers)
 {
-    $v = trim((string) $tag);
-    $v = preg_replace('/^[vV]\s*/', '', $v);
-    return $v;
+    $msg = ($err !== '' ? $err : 'HTTP ' . $httpCode);
+    foreach (array('x-ratelimit-remaining', 'x-ratelimit-reset', 'retry-after') as $h) {
+        if (isset($headers[$h]) && $headers[$h] !== '') {
+            $msg .= '; ' . $h . ': ' . $headers[$h];
+        }
+    }
+    if (is_string($body) && trim($body) !== '') {
+        $msg .= '; tresc: ' . db_sync_shorten_text($body, 300);
+    }
+    return $msg;
 }
 
-function db_sync_github_latest_tag()
+function db_sync_shorten_text($text, $len = 300)
 {
-    $json = db_sync_http_get(DBSYNC_GITHUB_TAGS_URL);
-    $data = json_decode($json, true);
-    if (!is_array($data)) {
-        throw new Exception('Nie udalo sie sparsowac odpowiedzi GitHub API.');
-    }
-    if (isset($data['message'])) {
-        throw new Exception('GitHub API: ' . $data['message']);
-    }
-    $tags = array();
-    foreach ($data as $item) {
-        if (!is_array($item) || !isset($item['name'])) {
-            continue;
+    $text = trim(preg_replace('/\s+/', ' ', (string) $text));
+    if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+        if (mb_strlen($text, 'UTF-8') > $len) {
+            return mb_substr($text, 0, $len, 'UTF-8') . '...';
         }
-        $v = db_sync_normalize_version($item['name']);
-        if ($v !== '' && preg_match('/^\d+(\.\d+)*([.-][A-Za-z0-9.]+)?$/', $v)) {
-            $tags[] = $v;
-        }
+        return $text;
     }
-    if (empty($tags)) {
-        throw new Exception('Na GitHubie nie znaleziono tagow z wersja (np. v1.0.12).');
+    if (strlen($text) > $len) {
+        return substr($text, 0, $len) . '...';
     }
-    usort($tags, 'version_compare');
-    return end($tags);
+    return $text;
 }
 
 function db_sync_remote_script()
 {
-    $body = db_sync_http_get(DBSYNC_GITHUB_RAW_URL);
+    // CDN raw.githubusercontent.com trzyma plik w cache ok. 5 minut - zmienny
+    // parametr w URL wymusza pobranie zawsze swiezej wersji (ma znaczenie
+    // zaraz po wypchnieciu wydania na GitHub).
+    $body = db_sync_http_get(DBSYNC_GITHUB_RAW_URL . '?t=' . time());
     if (stripos(ltrim($body), '<?php') !== 0) {
         throw new Exception('Pobrany plik nie zaczyna sie od <?php - to nie jest skrypt _dbsync.php.');
     }
     return $body;
+}
+
+/* Czy pobrany skrypt jest identyczny z lokalnym plikiem (CRLF/LF bez znaczenia).
+   Sluzy do wykrycia zmian na GitHub bez podbicia DBSYNC_VERSION. */
+function db_sync_body_same_as_local($body)
+{
+    $local = @file_get_contents(__FILE__);
+    if ($local === false) {
+        return true; // brak mozliwosci porownania - nie strasz uzytkownika
+    }
+    $eol = array("\r\n", "\r");
+    return md5(str_replace($eol, "\n", $local)) === md5(str_replace($eol, "\n", $body));
 }
 
 function db_sync_remote_version($body)
@@ -2459,17 +2498,28 @@ try {
         $files = isset($_POST['files']) && is_array($_POST['files']) ? $_POST['files'] : array();
         db_sync_delete($files);
     } elseif ($action === 'checkupdate') {
-        $latest = db_sync_github_latest_tag();
+        $body   = db_sync_remote_script();
+        $latest = db_sync_remote_version($body);
+        if ($latest === '') {
+            throw new Exception('Pobrany z GitHub (main) plik nie zawiera stalej DBSYNC_VERSION.');
+        }
+        $updUrl = htmlspecialchars($_SERVER['PHP_SELF']) . '?action=update';
+        $updBtn = '<a href="' . $updUrl . '" onclick="return confirm(\'Pobrac i zainstalowac wersje ' . htmlspecialchars($latest) . '?\\nObecny plik zostanie ZASTAPIONY bez kopii zapasowej.\\n\')" '
+            . 'style="font-family:Consolas,monospace;font-size:13px;padding:6px 14px;background:#080;color:#fff;border:0;border-radius:4px;text-decoration:none;cursor:pointer">[UPDATE]</a>';
         if (version_compare($latest, DBSYNC_VERSION, '>')) {
-            db_sync_log('AKTUALIZACJA', 'Dostepna nowsza wersja: ' . $latest . ' (obecna: ' . DBSYNC_VERSION . ')');
-            $updUrl = htmlspecialchars($_SERVER['PHP_SELF']) . '?action=update';
+            db_sync_log('AKTUALIZACJA', 'Dostepna nowsza wersja: ' . $latest . ' (obecna: ' . DBSYNC_VERSION . ', zrodlo: GitHub main)');
             echo '<div style="font-family:Consolas,monospace;font-size:14px;padding:10px 14px;margin:8px 0;border:1px solid #0a0;background:#eaffea;border-radius:4px">'
-                . '<b>Dostepna aktualizacja do wersji ' . htmlspecialchars($latest) . '</b> '
-                . '<a href="' . $updUrl . '" onclick="return confirm(\'Pobrac i zainstalowac wersje ' . htmlspecialchars($latest) . '?\\nObecny plik zostanie ZASTAPIONY bez kopii zapasowej.\\n\')" '
-                . 'style="font-family:Consolas,monospace;font-size:13px;padding:6px 14px;background:#080;color:#fff;border:0;border-radius:4px;text-decoration:none;cursor:pointer">[UPDATE]</a>'
+                . '<b>Dostepna aktualizacja do wersji ' . htmlspecialchars($latest) . '</b> ' . $updBtn
                 . '</div>' . "\n";
+        } elseif (version_compare($latest, DBSYNC_VERSION, '<')) {
+            db_sync_log('AKTUALIZACJA', 'GitHub main ma starsza wersje (' . $latest . ') niz lokalna (' . DBSYNC_VERSION . ') - lokalny plik jest nowszy (wydanie nie wypchniete?).');
+        } elseif (db_sync_body_same_as_local($body)) {
+            db_sync_log('AKTUALIZACJA', 'Brak nowszej wersji (GitHub main: ' . $latest . ', obecna: ' . DBSYNC_VERSION . ')');
         } else {
-            db_sync_log('AKTUALIZACJA', 'Brak nowszej wersji (najnowsza na GitHubie: ' . $latest . ', obecna: ' . DBSYNC_VERSION . ')');
+            db_sync_log('AKTUALIZACJA', 'Wersja na GitHub main (' . $latest . ') = lokalna, ale plik rozni sie od lokalnego (zmiany bez podbicia DBSYNC_VERSION?).');
+            echo '<div style="font-family:Consolas,monospace;font-size:14px;padding:10px 14px;margin:8px 0;border:1px solid #e90;background:#fff8e1;border-radius:4px">'
+                . '<b>Uwaga:</b> na GitHub (main) jest ten sam numer wersji (' . htmlspecialchars($latest) . '), ale inna zawartosc pliku. ' . $updBtn
+                . '</div>' . "\n";
         }
     } elseif ($action === 'update') {
         $body = db_sync_remote_script();
