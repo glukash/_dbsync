@@ -116,7 +116,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.8.0');
+define('DBSYNC_VERSION', '1.8.1');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -2237,7 +2237,10 @@ function db_sync_remote_script()
 function db_sync_remote_script_from_tarball()
 {
     try {
-        $gz = db_sync_http_get(DBSYNC_GITHUB_TARBALL_URL, 20);
+        // ?t= to tylko asekuracja na posrednie cache (codeload co prawda nie
+        // wysyla naglowkow cache, ale chwile po pushu zdarzyl sie zwrocic
+        // starsze archiwum); sprawdzone - przyjmuje parametr i zwraca 200.
+        $gz = db_sync_http_get(DBSYNC_GITHUB_TARBALL_URL . '?t=' . time(), 20);
     } catch (Exception $e) {
         return false;
     }
