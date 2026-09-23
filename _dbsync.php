@@ -41,11 +41,12 @@
  *   _dbsync.php?action=sync&MYSQL=/sciezka/mysql
  *   _dbsync.php?action=archive&7Z=/sciezka/7z (albo &ZIP=... / &TAR=...)
  *
- * Archiwa plikow tworzone sa narzedziami systemowymi: ZIP/7Z przez 7-Zip
- * (najbezpieczniejszy na Windows - poprawnie obsluguje polskie znaki),
- * TAR.GZ przez tar. Narzedzia sa wykrywane automatycznie (PATH + znane
- * katalogi), a archiwa zapisywane w ./_dbsyncf/ - katalog ten mozna wskazac
- * poza docroot zmieniajac stala DB_SYNC_ARCHIVE_DIR.
+ * Archiwa plikow tworzone sa narzedziami systemowymi: ZIP przez Info-ZIP
+ * 'zip' (na Linux - natywny narzedziem serwera; zapasowo 7-Zip) albo przez
+ * 7-Zip (na Windows, gdzie poprawnie obsluguje polskie znaki), 7Z przez
+ * 7-Zip, TAR.GZ przez tar. Narzedzia sa wykrywane automatycznie (PATH
+ * + znane katalogi), a archiwa zapisywane w ./_dbsyncf/ - katalog ten mozna
+ * wskazac poza docroot zmieniajac stala DB_SYNC_ARCHIVE_DIR.
  *
  * Wykluczenia archiwum sa edytowalne w formularzu (plik
  * _dbsyncf/archive-exclude-{site}.txt). Domyslnie wykluczone sa m.in.
@@ -118,7 +119,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.9.0');
+define('DBSYNC_VERSION', '1.10.1');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -1406,8 +1407,14 @@ function db_sync_archive_unlink($paths)
 
 function db_sync_archive_formats()
 {
+    /* Kolejnosc pozycji na liscie 'tools' wyznacza preferencje narzedzia dla
+       formatu (db_sync_archive_format_status bierze pierwsze dostepne).
+       ZIP: na Linux najpierw systemowy Info-ZIP 'zip', a 7-Zip tylko jako
+       zapas; na Windows odwrotnie - 7-Zip pierwszy, bo Info-ZIP gubi tam
+       polskie znaki (db_sync_archive_tool_utf8_ok). */
+    $zipTools = (PHP_OS_FAMILY === 'Windows') ? array('7z', 'zip') : array('zip', '7z');
     return array(
-        'zip'    => array('ext' => '.zip',    'label' => 'ZIP',    'tools' => array('7z', 'zip')),
+        'zip'    => array('ext' => '.zip',    'label' => 'ZIP',    'tools' => $zipTools),
         '7z'     => array('ext' => '.7z',     'label' => '7Z',     'tools' => array('7z')),
         'tar.gz' => array('ext' => '.tar.gz', 'label' => 'TAR.GZ', 'tools' => array('tar')),
     );
@@ -2179,7 +2186,11 @@ function db_sync_http_get($url, $timeout = 10)
         $body = curl_exec($ch);
         $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err = curl_error($ch);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) {
+            // od PHP 8.0 uchwyt curl jest obiektem i zwalnia sie sam, a PHP 8.5
+            // oznacza wywolanie curl_close() jako deprecated (bez efektu)
+            curl_close($ch);
+        }
         if ($body !== false && $httpCode === 200) {
             return $body;
         }
