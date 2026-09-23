@@ -10,10 +10,18 @@
  *   php -r "echo password_hash('TwojeHaslo', PASSWORD_DEFAULT);"
  *
  *   _dbsync.php (bez action)   -> lista plikow dumpu (pobieranie, SYNC, usuwanie)
+ *                                 + lista archiwow plikow (pobieranie, usuwanie)
  *   _dbsync.php?action=dump    -> zrzut bazy do ./_dbsync/YYMMDD-HHMMSS-dump-{db}.sql
  *   _dbsync.php?action=download&file=NAZWA -> pobranie pliku dumpu
  *   _dbsync.php?action=sync&file=NAZWA    -> wczytanie pliku do bazy
  *   _dbsync.php?action=delete (POST files[]) -> usuniecie zaznaczonych plikow
+ *   _dbsync.php?action=archive (GET)  -> formularz archiwum plikow serwisu
+ *   _dbsync.php?action=archive (POST) -> utworzenie archiwum w ./_dbsyncf/
+ *   _dbsync.php?action=downloadarchive&file=NAZWA -> pobranie archiwum
+ *   _dbsync.php?action=deletearchive (POST archives[]) -> usuniecie archiwow
+ *
+ * Nazwa archiwum: YYMMDD-HHMMSS-{domena}.{ext}, np. 260923-103115-example.com.zip
+ * (domena z zadania HTTP; przy braku - awaryjnie nazwa bazy).
  *   _dbsync.php?action=checkupdate    -> sprawdzenie nowszej wersji na GitHubie
  *   _dbsync.php?action=update         -> pobranie i zainstalowanie nowszej wersji
  *
@@ -28,6 +36,25 @@
  *
  *   _dbsync.php?action=dump&MYSQLDUMP=/sciezka/mysqldump
  *   _dbsync.php?action=sync&MYSQL=/sciezka/mysql
+ *   _dbsync.php?action=archive&7Z=/sciezka/7z (albo &ZIP=... / &TAR=...)
+ *
+ * Archiwa plikow tworzone sa narzedziami systemowymi: ZIP/7Z przez 7-Zip
+ * (najbezpieczniejszy na Windows - poprawnie obsluguje polskie znaki),
+ * TAR.GZ przez tar. Narzedzia sa wykrywane automatycznie (PATH + znane
+ * katalogi), a archiwa zapisywane w ./_dbsyncf/ - katalog ten mozna wskazac
+ * poza docroot zmieniajac stala DB_SYNC_ARCHIVE_DIR.
+ *
+ * Wykluczenia archiwum sa edytowalne w formularzu (plik
+ * _dbsyncf/archive-exclude-{site}.txt). Domyslnie wykluczone sa m.in.
+ * _dbsync/ (dumpy bazy), _dbsyncf/ (archiwa) i _dbsync.php (sam skrypt
+ * narzedzia) - usuniecie wzorca z listy oznacza dolaczenie do archiwum.
+ *
+ * Archiwum powstaje najpierw jako plik *.part i dopiero po sprawdzeniu
+ * wyniku jest przemianowywane na nazwe docelowa (YYMMDD-HHMMSS-{domena}.{ext}).
+ * Jesli PHP zostanie ubity w trakcie pakowania (timeout serwera), narzedzie
+ * systemowe zwykle konczy prace - przy nastepnym wejsciu na liste archiwow
+ * plik .part jest weryfikowany (log narzedzia + zapisany kod wyjscia)
+ * i automatycznie przemianowywany na nazwe docelowa.
  *
  * Jesli nie podano sciezki, binarki sa wykrywane automatycznie:
  * wyszukiwanie w PATH (where/which) oraz w znanych katalogach
@@ -71,6 +98,10 @@ if (!defined('PHP_OS_FAMILY')) {
 
 define('DB_SYNC_DIR',  __DIR__ . '/_dbsync');
 
+/* Katalog na archiwa plikow serwisu (przycisk "Utworz archiwum").
+   Mozna wskazac katalog poza docroot, np.: __DIR__ . '/../_dbsyncf' */
+define('DB_SYNC_ARCHIVE_DIR', __DIR__ . '/_dbsyncf');
+
 /* Dane logowania do narzedzia (niezalezne od konta WordPressa). */
 /* Hash hasla wygenerujesz poleceniem: */
 /*   php -r "echo password_hash('TwojeHaslo', PASSWORD_DEFAULT);" */
@@ -79,8 +110,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
-define('DBSYNC_DATE', '2026-09-15');
-define('DBSYNC_VERSION', '1.2.2');
+define('DBSYNC_DATE', '2026-09-23');
+define('DBSYNC_VERSION', '1.5.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -377,6 +408,12 @@ function db_sync_list_files()
 function db_sync_render_list()
 {
     $files = db_sync_list_files();
+    if (is_dir(DB_SYNC_DIR)) {
+        db_sync_htaccess_protect(DB_SYNC_DIR);
+    }
+    if (is_dir(DB_SYNC_ARCHIVE_DIR)) {
+        db_sync_htaccess_protect(DB_SYNC_ARCHIVE_DIR);
+    }
     echo '<div style="font-family:Consolas,monospace;font-size:14px">';
     echo '<p style="margin:0 0 6px;display:flex;gap:10px;align-items:center">'
         . '<button type="button" onclick="location.href=\'' . htmlspecialchars($_SERVER['PHP_SELF']) . '\'" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">HOME</button>'
@@ -406,6 +443,30 @@ function db_sync_render_list()
     echo '<form method="get" action="" style="margin:14px 0 0">'
         . '<input type="hidden" name="action" value="dump">'
         . '<button type="submit" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#af0090;color:#fff;border:0;border-radius:4px">Generuj nowy dump bazy</button>'
+        . '</form>';
+
+    $archives = db_sync_archive_list();
+    echo '<h3 style="margin:20px 0 6px">Archiwa plikow (' . count($archives) . ')</h3>';
+    if (empty($archives)) {
+        echo '<p>Brak archiwow w katalogu <b>' . htmlspecialchars(basename(DB_SYNC_ARCHIVE_DIR)) . '</b>.</p>';
+    } else {
+        echo '<form method="post" action="">'
+            . '<ul style="list-style:none;padding:0;margin:0">';
+        foreach ($archives as $a) {
+            $size = db_sync_human_size(filesize(DB_SYNC_ARCHIVE_DIR . '/' . $a));
+            $downloadHref = '?action=downloadarchive&file=' . rawurlencode($a);
+            echo '<li style="margin:5px 0">'
+                . '<input type="checkbox" name="archives[]" value="' . htmlspecialchars($a) . '" style="margin-right:6px;vertical-align:middle">'
+                . '<a href="' . $downloadHref . '" title="Pobierz archiwum">' . htmlspecialchars($a) . '</a>'
+                . ' <small style="color:#888">(' . $size . ')</small></li>';
+        }
+        echo '</ul>'
+            . '<button type="submit" name="action" value="deletearchive" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#c00;color:#fff;border:0;border-radius:4px;margin-top:10px" onclick="var c=this.form.querySelectorAll(\'input[type=checkbox]:checked\');if(!c.length){alert(\'Zaznacz archiwa do usuniecia\');return false;}return confirm(\'Usunac zaznaczone archiwa?\')">Usun zaznaczone</button>'
+            . '</form>';
+    }
+    echo '<form method="get" action="" style="margin:14px 0 0">'
+        . '<input type="hidden" name="action" value="archive">'
+        . '<button type="submit" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#0a7;color:#fff;border:0;border-radius:4px">Utworz archiwum</button>'
         . '</form>';
     echo '</div>';
 }
@@ -486,6 +547,122 @@ function db_sync_render_dump_form($creds, $host, $port)
     echo '</div>';
 }
 
+function db_sync_render_archive_form($creds)
+{
+    echo '<div style="font-family:Consolas,monospace;font-size:14px">';
+    echo '<p style="margin:0 0 6px;display:flex;gap:10px;align-items:center">'
+        . '<button type="button" onclick="location.href=\'' . htmlspecialchars($_SERVER['PHP_SELF']) . '\'" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">HOME</button>'
+        . '<button type="button" onclick="window.open(\'' . htmlspecialchars(db_sync_site_url()) . '\',\'_blank\')" title="Otworz serwis" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#555;color:#fff;border:0;border-radius:4px">-&gt;</button>'
+        . '</p>';
+
+    if (is_dir(DB_SYNC_ARCHIVE_DIR)) {
+        db_sync_htaccess_protect(DB_SYNC_ARCHIVE_DIR);
+    }
+
+    $status   = db_sync_archive_format_status();
+    $root     = db_sync_archive_root();
+    $site     = db_sync_archive_site_key($creds);
+    $patterns = db_sync_archive_exclude_load($site);
+    $hardDirs = db_sync_archive_hard_dirs();
+    $stats    = db_sync_archive_collect($root, $patterns, $hardDirs, '', 5);
+    $free     = is_dir(DB_SYNC_ARCHIVE_DIR) ? @disk_free_space(DB_SYNC_ARCHIVE_DIR) : @disk_free_space($root);
+
+    $rows    = array();
+    $default = '';
+    foreach ($status as $key => $st) {
+        $ok   = $st['ok'];
+        $note = '';
+        if ($ok) {
+            $note = 'narzedzie: ' . $st['bin'];
+            if (!db_sync_archive_tool_utf8_ok($st['tool']) && $stats['non_ascii']) {
+                $ok   = false;
+                $note = htmlspecialchars(basename($st['bin'])) . ' na Windows moze pomijac nazwy z polskimi znakami - wybierz ZIP albo 7Z (7-Zip)';
+            }
+        } else {
+            $note = 'niedostepny: brak narzedzia (' . implode(' / ', $st['fmt']['tools']) . ')';
+        }
+        if ($ok && $default === '') {
+            $default = $key;
+        }
+        $rows[$key] = array(
+            'ok'    => $ok,
+            'note'  => $note,
+            'label' => $st['fmt']['label'] . ' (' . $st['fmt']['ext'] . ')',
+        );
+    }
+    if (isset($rows['zip']) && $rows['zip']['ok']) {
+        $default = 'zip';
+    }
+
+    echo '<h3 style="margin:4px 0 6px">Archiwum plikow serwisu</h3>';
+    echo '<p style="margin:0 0 4px;color:#555">Katalog zrodlowy: <b>' . htmlspecialchars($root) . '</b> | katalog docelowy: <b>' . htmlspecialchars(DB_SYNC_ARCHIVE_DIR) . '</b></p>';
+    echo '<p style="margin:0 0 4px;color:#555">Do archiwizacji: <b>' . ($stats['partial'] ? 'co najmniej ' : '') . $stats['files'] . '</b> plikow'
+        . ' (' . db_sync_human_size($stats['bytes']) . ')'
+        . ($stats['partial'] ? ' - szacowanie przerwane po 5 s' : '')
+        . ($stats['skipped'] > 0 ? ', pominieto ' . $stats['skipped'] . ' pozycji' : '')
+        . ($free !== false ? ' | wolne miejsce: ' . db_sync_human_size($free) : '')
+        . '</p>';
+    echo '<p style="margin:0 0 4px;color:#555">Bezwarunkowo pominiete: <b>'
+        . (empty($hardDirs) ? 'brak' : htmlspecialchars(implode(', ', $hardDirs)))
+        . '</b> (katalog archiwow - archiwa nie trafiaja do archiwum).</p>';
+    // wzorce edytowalne: pokazujemy, co jest aktualnie wykluczone, a co dolaczone
+    $exclManaged = array();
+    $inclManaged = array();
+    foreach (db_sync_archive_managed_exclude() as $managed) {
+        if ($managed === '_dbsyncf/') {
+            continue; // katalog archiwow jest pomijany bezwarunkowo
+        }
+        if (db_sync_archive_exclude_has($patterns, $managed)) {
+            $exclManaged[] = $managed;
+        } else {
+            $inclManaged[] = $managed;
+        }
+    }
+    if (!empty($exclManaged) || !empty($inclManaged)) {
+        echo '<p style="margin:0 0 10px;color:#555">';
+        if (!empty($exclManaged)) {
+            echo 'Wykluczone wzorcami z listy ponizej: <b>' . htmlspecialchars(implode(', ', $exclManaged)) . '</b>'
+                . ' - usun wzorzec, jesli chcesz dolaczyc go do archiwum.';
+        }
+        if (!empty($inclManaged)) {
+            echo ($exclManaged ? '<br>' : '') . 'Brak wzorca na liscie (trafi do archiwum): <b>'
+                . htmlspecialchars(implode(', ', $inclManaged)) . '</b>.';
+        }
+        echo '</p>';
+    }
+
+    echo '<script>function dbsyncArchiveConfirm(btn){var f=btn.form;var r=f.querySelector(\'input[name=format]:checked\');var l=r?r.getAttribute(\'data-label\'):\'?\';return confirm(\'Utworzyc archiwum plikow?\nFormat: \'+l+\'\nMoze to potrwac kilka minut.\');}</script>';
+
+    echo '<form method="post" action="">'
+        . '<input type="hidden" name="action" value="archive">';
+    foreach (array('7Z', 'ZIP', 'TAR') as $param) {
+        if (!empty($_GET[$param])) {
+            echo '<input type="hidden" name="' . $param . '" value="' . htmlspecialchars($_GET[$param]) . '">';
+        }
+    }
+    echo '<p style="margin:0 0 4px">Format:</p>';
+    foreach ($rows as $key => $row) {
+        $label = htmlspecialchars($row['label']);
+        echo '<div style="margin:3px 0">'
+            . '<label><input type="radio" name="format" value="' . htmlspecialchars($key) . '" data-label="' . $label . '"'
+            . (($key === $default) ? ' checked' : '') . ($row['ok'] ? '' : ' disabled') . '> '
+            . $label . '</label> '
+            . '<small style="color:#888">' . htmlspecialchars($row['note']) . '</small>'
+            . '</div>';
+    }
+    echo '<p style="margin:12px 0 4px">Wykluczenia (jeden wzorzec na linie; katalog konczy "/", np. <b>cache/</b>; wzorce z gwiazdka, np. <b>*.log</b>):</p>'
+        . '<textarea name="exclude" rows="8" cols="60" style="font-family:Consolas,monospace;font-size:13px;padding:6px">'
+        . htmlspecialchars(implode("\n", $patterns)) . '</textarea>';
+    echo '<p style="margin:12px 0 0">';
+    if ($default !== '') {
+        echo '<button type="submit" onclick="return dbsyncArchiveConfirm(this);" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#0a7;color:#fff;border:0;border-radius:4px">Utworz archiwum</button>';
+    } else {
+        echo '<b style="color:#c00">Brak dostepnych narzedzi archiwizujacych (7-Zip / zip / tar). Zainstaluj 7-Zip albo podaj sciezke w URL, np. ?7Z=C:/sciezka/7z.exe</b>';
+    }
+    echo '</p></form>';
+    echo '</div>';
+}
+
 function db_sync_conn_args($host, $port)
 {
     if (strpos($host, '/') === 0) {
@@ -545,11 +722,11 @@ function db_sync_binary_candidates($name)
     return $candidates;
 }
 
-function db_sync_find_binary($names, $candidates = array())
+function db_sync_find_binary($names, $candidates = array(), $lookups = array('where', 'which'))
 {
     // 1) szukanie w PATH przez where (Windows) / which (Linux)
     foreach ($names as $name) {
-        foreach (array('where', 'which') as $lookup) {
+        foreach ($lookups as $lookup) {
             $out = array();
             $code = -1;
             db_sync_exec($lookup . ' ' . escapeshellarg($name) . ' 2>&1', $out, $code);
@@ -733,6 +910,7 @@ function db_sync_dump($creds, $host, $port, $exclude = array())
     if (!is_writable(DB_SYNC_DIR)) {
         throw new Exception('Katalog ' . DB_SYNC_DIR . ' nie jest zapisywalny.');
     }
+    db_sync_htaccess_protect(DB_SYNC_DIR);
 
     $prefix = '';
     if (!empty($exclude)) {
@@ -865,15 +1043,14 @@ function db_sync_import($creds, $host, $port, $file)
 /* Download                                                            */
 /* ------------------------------------------------------------------ */
 
-function db_sync_download($file)
+function db_sync_send_file($path, $mime, $filename = '')
 {
-    $path = db_sync_file_path($file);
-    if ($path === false) {
-        throw new Exception('Nieprawidlowy lub nieistniejacy plik dumpu: ' . $file);
+    if ($filename === '') {
+        $filename = basename($path);
     }
     $size = filesize($path);
-    header('Content-Type: application/octet-stream');
-    header('Content-Disposition: attachment; filename="' . basename($path) . '"');
+    header('Content-Type: ' . $mime);
+    header('Content-Disposition: attachment; filename="' . str_replace('"', '', $filename) . '"');
     header('Content-Length: ' . $size);
     header('Cache-Control: no-cache, must-revalidate');
     while (ob_get_level() > 0) {
@@ -881,6 +1058,15 @@ function db_sync_download($file)
     }
     readfile($path);
     exit;
+}
+
+function db_sync_download($file)
+{
+    $path = db_sync_file_path($file);
+    if ($path === false) {
+        throw new Exception('Nieprawidlowy lub nieistniejacy plik dumpu: ' . $file);
+    }
+    db_sync_send_file($path, 'application/octet-stream');
 }
 
 /* ------------------------------------------------------------------ */
@@ -907,6 +1093,978 @@ function db_sync_delete($files)
         }
     }
     db_sync_log('USUWANIE GOTOWE', $deleted . ' plik(ow) usunieto');
+}
+
+/* ------------------------------------------------------------------ */
+/* Archiwa plikow (narzedzia systemowe: 7-Zip / zip / tar)             */
+/* ------------------------------------------------------------------ */
+
+function db_sync_archive_root()
+{
+    return rtrim(str_replace('\\', '/', __DIR__), '/');
+}
+
+function db_sync_archive_hard_dirs()
+{
+    // Bezwarunkowo (poza lista wykluczen, ktora jest edytowalna) pomijany jest
+    // tylko katalog, do ktorego trafia samo archiwum - inaczej archiwum
+    // pakowaloby poprzednie archiwa (i wlasny plik tymczasowy *.part).
+    // Katalog _dbsync (dumpy bazy) jest zwyklym wzorcem w wykluczeniach.
+    $root = db_sync_archive_root();
+    $out  = array();
+    $arc  = rtrim(str_replace('\\', '/', DB_SYNC_ARCHIVE_DIR), '/');
+    if ($arc !== '' && $arc !== $root && strpos($arc . '/', $root . '/') === 0) {
+        $rel = trim(substr($arc, strlen($root)), '/');
+        if ($rel !== '') {
+            $out[] = $rel;
+        }
+    }
+    return $out;
+}
+
+function db_sync_archive_site_key($creds)
+{
+    $key = '';
+    if (is_array($creds) && !empty($creds['DB_NAME'])) {
+        $key = db_sync_safe_name($creds['DB_NAME']);
+    }
+    if ($key === '') {
+        $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
+        $host = preg_replace('/:\d+$/', '', (string) $host);
+        $key  = db_sync_safe_name($host);
+    }
+    if ($key === '') {
+        $key = db_sync_safe_name(basename(db_sync_archive_root()));
+    }
+    if ($key === '') {
+        $key = 'site';
+    }
+    return $key;
+}
+
+function db_sync_archive_domain_key()
+{
+    // Domena z biezacego zadania HTTP -> nazwa pliku archiwum
+    // (YYMMDD-HHMMSS-{domena}.{ext}). Kropki zostaja, bo domena ma byc czytelna.
+    $host = '';
+    foreach (array('HTTP_HOST', 'SERVER_NAME') as $key) {
+        if (!empty($_SERVER[$key])) {
+            $host = (string) $_SERVER[$key];
+            break;
+        }
+    }
+    $host = strtolower(preg_replace('/:\d+$/', '', trim($host)));
+    $host = preg_replace('/[^a-z0-9.-]/', '_', $host);
+    return trim($host, '.-_');
+}
+
+function db_sync_htaccess_protect($dir)
+{
+    $dir = rtrim(str_replace('\\', '/', $dir), '/');
+    if ($dir === '' || !is_dir($dir)) {
+        return false;
+    }
+    $path = $dir . '/.htaccess';
+    if (is_file($path)) {
+        return true;
+    }
+    $content = "# _dbsync - blokada dostepu z sieci (pliki zawieraja dane wrazliwe)\n"
+        . "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n"
+        . "<IfModule !mod_authz_core.c>\n    Order allow,deny\n    Deny from all\n</IfModule>\n";
+    if (@file_put_contents($path, $content) === false) {
+        db_sync_log('OCHRONA', 'UWAGA: nie moge utworzyc ' . $path . ' - zablokuj dostep do katalogu recznie (Apache/nginx)', true);
+        return false;
+    }
+    db_sync_log('OCHRONA', 'utworzono ' . $path . ' (deny all)');
+    return true;
+}
+
+function db_sync_archive_dir($create = false)
+{
+    $dir = DB_SYNC_ARCHIVE_DIR;
+    if (!is_dir($dir)) {
+        if (!$create) {
+            return false;
+        }
+        if (!@mkdir($dir, 0755, true)) {
+            throw new Exception('Nie moge utworzyc katalogu ' . $dir);
+        }
+        db_sync_log('KATALOG', 'utworzono ' . $dir);
+    }
+    if ($create) {
+        if (!is_writable($dir)) {
+            throw new Exception('Katalog ' . $dir . ' nie jest zapisywalny.');
+        }
+        db_sync_htaccess_protect($dir);
+    }
+    return $dir;
+}
+
+/* Opieka nad plikami tymczasowymi w katalogu archiwow:
+   1) dokonczenie archiwow przerwanych po stronie PHP (np. ubity proces CGI
+      przez timeout serwera) - jesli log i kod wyjscia narzedzia pakujacego
+      potwierdzaja sukces, plik .part trafia na liste jako archiwum gotowe,
+   2) usuniecie osieroconych plikow tymczasowych starszych niz 24h.
+   Zwraca liste odtworzonych archiwow. */
+function db_sync_archive_cleanup_parts($quietSeconds = 300)
+{
+    $dir = DB_SYNC_ARCHIVE_DIR;
+    if (!is_dir($dir)) {
+        return array();
+    }
+    $recovered = db_sync_archive_recover_parts($quietSeconds);
+    clearstatcache();
+    // osierocone pliki po nieudanym zadaniu (starsze niz 24h)
+    foreach (array('/*.part', '/dbsync-*') as $mask) {
+        foreach (glob($dir . $mask) ?: array() as $path) {
+            if (is_file($path) && (time() - filemtime($path)) > 86400) {
+                @unlink($path);
+            }
+        }
+    }
+    return $recovered;
+}
+
+/* Dla pliku <nazwa>.part zwraca nazwy plikow towarzyszacych (nazwa docelowa,
+   lista plikow, log narzedzia, plik statusu). Nazwy te sa pochodna nazwy
+   docelowej, a nie losowe - dzieki temu po przerwanym zadaniu wiadomo,
+   do ktorego archiwum nalezy osierocony plik .part. */
+function db_sync_archive_part_paths($part)
+{
+    $base = basename($part);
+    if (substr($base, -5) !== '.part') {
+        return false;
+    }
+    $stamp = substr($base, 0, -5);
+    if ($stamp === '') {
+        return false;
+    }
+    $dir = dirname($part);
+    return array(
+        'stamp'  => $stamp,
+        'target' => $dir . '/' . $stamp,
+        'list'   => $dir . '/dbsync-list-' . $stamp . '.txt',
+        'log'    => $dir . '/dbsync-log-' . $stamp . '.txt',
+        'status' => $dir . '/dbsync-status-' . $stamp . '.txt',
+    );
+}
+
+/* Dopisek do komendy narzedzia: powloka zapisuje kod wyjscia do pliku
+   statusu PO zakonczeniu narzedzia, czyli rowniez wtedy, gdy proces PHP
+   zostanie ubity i nie wykona juz zadnego kodu. Bez tego nie da sie
+   odroznic archiwum gotowego od przerwanego w polowie. */
+function db_sync_archive_status_suffix($statusFile)
+{
+    $st = db_sync_bin_arg($statusFile);
+    if (PHP_OS_FAMILY === 'Windows') {
+        // uwaga: "%ERRORLEVEL%" rozwija sie PRZED uruchomieniem narzedzia,
+        // dlatego wynik sprawdzamy konstrukcja "if errorlevel" (oceniana
+        // w trakcie wykonywania); spacja przed ">>" jest konieczna, inaczej
+        // cmd potraktowalby konczaca cyfre jako numer strumienia
+        return ' & if errorlevel 2 (echo exit=2 >>' . $st . ')'
+            . ' else if errorlevel 1 (echo exit=1 >>' . $st . ')'
+            . ' else (echo exit=0 >>' . $st . ')';
+    }
+    // kod wyjscia zostawiamy tez dla exec(), zeby nie zmienic jego wyniku
+    return '; ec=$?; echo exit=$ec >> ' . $st . '; exit $ec';
+}
+
+/* Kod wyjscia narzedzia zapisany przez powloke (null, gdy brak pliku). */
+function db_sync_archive_status_code($statusFile)
+{
+    if (!is_file($statusFile)) {
+        return null;
+    }
+    $text = @file_get_contents($statusFile);
+    if ($text === false || !preg_match('/exit=(\d+)/', $text, $m)) {
+        return null;
+    }
+    return (int) $m[1];
+}
+
+/* Weryfikacja osieroconego pliku .part: '' gdy archiwum jest kompletne,
+   inaczej powod odrzucenia (tekst). */
+function db_sync_archive_part_verdict($part, $info)
+{
+    $size = @filesize($part);
+    if ($size === false || $size === 0) {
+        return 'plik pusty';
+    }
+    if (!is_file($info['list'])) {
+        return 'brak listy plikow narzedzia';
+    }
+    // log moze byc pusty - "zip -q" i "tar" nie wypisuja nic przy sukcesie
+    $tail = is_file($info['log']) ? db_sync_archive_log_tail($info['log']) : '';
+    foreach (db_sync_archive_output_errors($tail) as $line) {
+        return 'log narzedzia zawiera blad: ' . $line;
+    }
+    $expected = 0;
+    $fh = @fopen($info['list'], 'rb');
+    if ($fh !== false) {
+        while (($line = fgets($fh)) !== false) {
+            if (trim($line) !== '') {
+                $expected++;
+            }
+        }
+        fclose($fh);
+    }
+    if ($expected === 0) {
+        return 'pusta lista plikow';
+    }
+    if (preg_match('/Files read from disk:\s*(\d+)/', $tail, $m)) {
+        // 7-Zip: log podaje liczbe przetworzonych plikow - najmocniejszy dowod
+        if (stripos($tail, 'Everything is Ok') === false) {
+            return 'brak potwierdzenia "Everything is Ok" w logu';
+        }
+        if ((int) $m[1] !== $expected) {
+            return 'narzedzie przetworzylo ' . (int) $m[1] . ' z ' . $expected . ' plikow';
+        }
+        return '';
+    }
+    // brak podsumowania w logu (zip/tar) - rozstrzyga kod wyjscia zapisany
+    // przez powloke po zakonczeniu narzedzia
+    $code = db_sync_archive_status_code($info['status']);
+    if ($code === null) {
+        return 'brak pliku statusu (nie wiadomo, czy narzedzie skonczylo prace)';
+    }
+    if ($code > 1) {
+        return 'narzedzie zakonczylo sie bledem (kod ' . $code . ')';
+    }
+    return '';
+}
+
+/* Ratowanie archiwow po zadaniach przerwanych przez serwer: gdy log i status
+   narzedzia potwierdzaja sukces, dokoncza zmiane nazwy .part -> nazwa docelowa
+   (PHP tego nie zrobil, bo zostal ubity). Pliki mlodsze niz $quietSeconds
+   pomijamy - moze je wlasnie zapisywac narzedzie. */
+function db_sync_archive_recover_parts($quietSeconds = 300)
+{
+    $dir = DB_SYNC_ARCHIVE_DIR;
+    $done = array();
+    if (!is_dir($dir)) {
+        return $done;
+    }
+    $parts = glob($dir . '/*.part');
+    if ($parts === false) {
+        return $done;
+    }
+    clearstatcache();
+    foreach ($parts as $part) {
+        if (!is_file($part)) {
+            continue;
+        }
+        $info = db_sync_archive_part_paths($part);
+        if ($info === false) {
+            continue;
+        }
+        if (time() - (int) @filemtime($part) < $quietSeconds) {
+            continue;
+        }
+        $verdict = db_sync_archive_part_verdict($part, $info);
+        if ($verdict !== '') {
+            db_sync_log('PLIK .PART', basename($part) . ': ' . $verdict
+                . ' (zadanie przerwane albo nadal trwa; usuniecie po 24h)', true);
+            continue;
+        }
+        if (!@rename($part, $info['target'])) {
+            db_sync_log('OSTRZEZENIE', 'nie moge odtworzyc archiwum ' . basename($info['target'])
+                . ' z pliku ' . basename($part), true);
+            continue;
+        }
+        db_sync_archive_unlink(array($info['list'], $info['log'], $info['status']));
+        $size = @filesize($info['target']);
+        if ($size === false) {
+            $size = 0;
+        }
+        db_sync_log('ARCHIWUM ODTWORZONE', basename($info['target']) . ' (' . db_sync_human_size($size) . ')'
+            . ' - narzedzie zakonczylo prace, ale PHP nie zmienilo nazwy pliku .part');
+        $done[] = basename($info['target']);
+    }
+    return $done;
+}
+
+function db_sync_archive_unlink($paths)
+{
+    foreach ((array) $paths as $path) {
+        if ($path !== '' && $path !== false && is_file($path)) {
+            @unlink($path);
+        }
+    }
+}
+
+function db_sync_archive_formats()
+{
+    return array(
+        'zip'    => array('ext' => '.zip',    'label' => 'ZIP',    'tools' => array('7z', 'zip')),
+        '7z'     => array('ext' => '.7z',     'label' => '7Z',     'tools' => array('7z')),
+        'tar.gz' => array('ext' => '.tar.gz', 'label' => 'TAR.GZ', 'tools' => array('tar')),
+    );
+}
+
+function db_sync_archive_tool_names()
+{
+    return array(
+        '7z'  => array('7z', '7za', '7zz', '7z.exe', '7za.exe', '7zz.exe'),
+        'zip' => array('zip', 'zip.exe'),
+        'tar' => array('tar', 'tar.exe'),
+    );
+}
+
+function db_sync_archive_tool_arg($key)
+{
+    return strtoupper(str_replace('.', '', $key));
+}
+
+function db_sync_archive_candidates($name)
+{
+    $candidates = array();
+    if (PHP_OS_FAMILY === 'Windows') {
+        $roots = array(
+            'C:/Program Files/7-Zip',
+            'C:/Program Files (x86)/7-Zip',
+            'C:/ProgramData/chocolatey/bin',
+            'C:/Windows/System32',
+        );
+    } else {
+        $roots = array('/usr/bin', '/bin', '/usr/local/bin', '/usr/sbin', '/sbin', '/snap/bin', '/opt/lampp/bin');
+    }
+    foreach ($roots as $root) {
+        if (is_dir($root)) {
+            $candidates[] = $root . '/' . $name;
+        }
+    }
+    return $candidates;
+}
+
+function db_sync_archive_tools()
+{
+    static $tools = null;
+    if ($tools !== null) {
+        return $tools;
+    }
+    $lookups = (PHP_OS_FAMILY === 'Windows') ? array('where') : array('which');
+    $tools   = array();
+    foreach (db_sync_archive_tool_names() as $key => $names) {
+        // reczne wskazanie sciezki w URL, np. ?7Z=/pelna/sciezka/7z
+        $param = db_sync_get_param(db_sync_archive_tool_arg($key));
+        if ($param !== '') {
+            if (is_file($param)) {
+                $tools[$key] = $param;
+            }
+            continue;
+        }
+        $candidates = array();
+        foreach ($names as $name) {
+            foreach (db_sync_archive_candidates($name) as $candidate) {
+                $candidates[] = $candidate;
+            }
+        }
+        $bin = db_sync_find_binary($names, $candidates, $lookups);
+        if ($bin !== false) {
+            $tools[$key] = $bin;
+        }
+    }
+    return $tools;
+}
+
+function db_sync_archive_format_status()
+{
+    $tools = db_sync_archive_tools();
+    $out   = array();
+    foreach (db_sync_archive_formats() as $key => $fmt) {
+        $tool = '';
+        $bin  = '';
+        foreach ($fmt['tools'] as $candidate) {
+            if (isset($tools[$candidate])) {
+                $tool = $candidate;
+                $bin  = $tools[$candidate];
+                break;
+            }
+        }
+        $out[$key] = array(
+            'fmt'  => $fmt,
+            'ok'   => ($tool !== ''),
+            'tool' => $tool,
+            'bin'  => $bin,
+        );
+    }
+    return $out;
+}
+
+function db_sync_archive_tool_utf8_ok($tool)
+{
+    // 7-Zip czyta liste plikow jako UTF-8 (na Windows tez); bsdtar/zip
+    // na Windows oczekuja strony kodowej ANSI i cicho gubia polskie znaki.
+    if (PHP_OS_FAMILY !== 'Windows') {
+        return true;
+    }
+    return ($tool === '7z');
+}
+
+function db_sync_archive_default_exclude()
+{
+    return array(
+        // dumpy bazy, archiwa i sam skrypt narzedzia - wzorce edytowalne:
+        // usuniecie wzorca z listy oznacza dolaczenie do archiwum
+        '_dbsync/',
+        '_dbsyncf/',
+        '_dbsync.php',
+        '.git/',
+        '.svn/',
+        'node_modules/',
+        'cache/',
+        'var/cache/',
+        'wp-content/cache/',
+        '*.log',
+        '*.tmp',
+        '.DS_Store',
+        'Thumbs.db',
+    );
+}
+
+/* Wzorce "systemowe" - dopisywane jednorazowo do pliku wykluczen przy
+   migracji (patrz db_sync_archive_exclude_load). */
+function db_sync_archive_managed_exclude()
+{
+    return array('_dbsync/', '_dbsyncf/', '_dbsync.php');
+}
+
+function db_sync_archive_exclude_path($site)
+{
+    return DB_SYNC_ARCHIVE_DIR . '/archive-exclude-' . $site . '.txt';
+}
+
+/* Znacznik w pliku wykluczen: obecnosc znacznika danej wersji = plik
+   obslugiwany przez wersje skryptu, ktora migracje ma juz za soba;
+   brak znacznika (albo znacznik starszej wersji) = jednorazowe uzupelnienie
+   brakujacych wzorcow systemowych. */
+function db_sync_archive_exclude_marker()
+{
+    return '# dbsync-exclude-v3';
+}
+
+/* Wzorce dopisywane przy migracji - zaleznie od wersji pliku:
+   brak znacznika  = plik z wersji <= 1.3.1 (_dbsync/ i _dbsyncf/ byly
+                     wtedy wykluczone na sztywno),
+   znacznik v2     = plik z 1.4.0 (dochodzi tylko wzorzec samego skryptu). */
+function db_sync_archive_exclude_migration($text)
+{
+    if (strpos($text, '# dbsync-exclude-') === false) {
+        return db_sync_archive_managed_exclude();
+    }
+    if (strpos($text, '# dbsync-exclude-v2') !== false) {
+        return array('_dbsync.php');
+    }
+    return array();
+}
+
+function db_sync_archive_exclude_has($lines, $pattern)
+{
+    $pattern = trim(str_replace('\\', '/', (string) $pattern), '/');
+    foreach ((array) $lines as $line) {
+        if (rtrim(trim(str_replace('\\', '/', (string) $line)), '/') === $pattern) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function db_sync_archive_exclude_clean($lines)
+{
+    $out = array();
+    if (is_string($lines)) {
+        $lines = preg_split('/\r\n|\r|\n/', $lines);
+    }
+    if (!is_array($lines)) {
+        return $out;
+    }
+    foreach ($lines as $line) {
+        $line = trim((string) $line);
+        if ($line !== '' && substr($line, 0, 1) !== '#') {
+            $out[] = $line;
+        }
+    }
+    return array_values(array_unique($out));
+}
+
+function db_sync_archive_exclude_load($site)
+{
+    $path = db_sync_archive_exclude_path($site);
+    if (!is_file($path)) {
+        return db_sync_archive_default_exclude();
+    }
+    $text = @file_get_contents($path);
+    if ($text === false) {
+        return db_sync_archive_default_exclude();
+    }
+    $lines = db_sync_archive_exclude_clean($text);
+    // Migracja plikow wykluczen z wczesniejszych wersji: dopisujemy wzorce
+    // systemowe, ktorych wtedy nie bylo na liscie (raz, o czym informuje
+    // znacznik). Potem decyduje juz tylko zawartosc pliku, wiec usuniecie
+    // wzorca przez uzytkownika (np. _dbsync/ albo _dbsync.php, aby dolaczyc
+    // dumpy albo sam skrypt do archiwum) jest respektowane.
+    if (strpos($text, db_sync_archive_exclude_marker()) === false) {
+        $added = array();
+        foreach (db_sync_archive_exclude_migration($text) as $extra) {
+            if (!db_sync_archive_exclude_has($lines, $extra)) {
+                $lines[] = $extra;
+                $added[] = $extra;
+            }
+        }
+        try {
+            db_sync_archive_exclude_save($site, $lines);
+            if (!empty($added)) {
+                db_sync_log('MIGRACJA WYKLUCZEN', 'dopisano wzorce: ' . implode(', ', $added));
+            }
+        } catch (Exception $e) {
+            db_sync_log('OSTRZEZENIE', 'nie moge zapisac migracji wykluczen: ' . $e->getMessage(), true);
+        }
+    }
+    return $lines;
+}
+
+function db_sync_archive_exclude_save($site, $lines)
+{
+    if (!is_dir(DB_SYNC_ARCHIVE_DIR)) {
+        db_sync_archive_dir(true);
+    }
+    $clean = db_sync_archive_exclude_clean($lines);
+    $body  = db_sync_archive_exclude_marker() . "\n";
+    foreach ($clean as $line) {
+        $body .= $line . "\n";
+    }
+    $path = db_sync_archive_exclude_path($site);
+    if (@file_put_contents($path, $body) === false) {
+        throw new Exception('Nie moge zapisac pliku wykluczen: ' . $path);
+    }
+    db_sync_log('WYKLUCZENIA ZAPISANE', basename($path) . ' (' . count($clean) . ' wzorcow)');
+}
+
+function db_sync_archive_excluded($rel, $patterns, $isDir = false)
+{
+    $rel  = str_replace('\\', '/', $rel);
+    $base = basename($rel);
+    foreach ($patterns as $pattern) {
+        $pattern = str_replace('\\', '/', trim((string) $pattern));
+        if ($pattern === '') {
+            continue;
+        }
+        if (substr($pattern, -1) === '/') {
+            // wzorzec katalogu, np. cache/ albo wp-content/cache/
+            $dir = rtrim($pattern, '/');
+            if ($rel === $dir || strpos($rel, $dir . '/') === 0 || strpos($rel, '/' . $dir . '/') !== false) {
+                return true;
+            }
+            continue;
+        }
+        if (strpos($pattern, '*') !== false || strpos($pattern, '?') !== false) {
+            if (fnmatch($pattern, $base)) {
+                return true;
+            }
+            if (strpos($pattern, '/') !== false && fnmatch($pattern, $rel)) {
+                return true;
+            }
+            continue;
+        }
+        if ($base === $pattern) {
+            return true;
+        }
+        if ($isDir && strpos('/' . $rel . '/', '/' . $pattern . '/') !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function db_sync_archive_hard_excluded($rel, $hardDirs)
+{
+    $rel = trim(str_replace('\\', '/', $rel), '/');
+    foreach ($hardDirs as $dir) {
+        $dir = trim(str_replace('\\', '/', $dir), '/');
+        if ($dir !== '' && ($rel === $dir || strpos($rel, $dir . '/') === 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function db_sync_archive_collect($root, $patterns, $hardDirs, $listFile = '', $maxSeconds = 0)
+{
+    $stats = array(
+        'files'     => 0,
+        'bytes'     => 0,
+        'skipped'   => 0,
+        'non_ascii' => false,
+        'partial'   => false,
+        'errors'    => array(),
+    );
+    $fh = false;
+    if ($listFile !== '') {
+        $fh = @fopen($listFile, 'wb');
+        if ($fh === false) {
+            throw new Exception('Nie moge zapisac listy plikow: ' . $listFile);
+        }
+    }
+    $deadline = ($maxSeconds > 0) ? (microtime(true) + $maxSeconds) : 0;
+    $stack    = array('');
+    while (!empty($stack)) {
+        $relDir  = array_pop($stack);
+        $absDir  = ($relDir === '') ? $root : $root . '/' . $relDir;
+        $entries = @scandir($absDir);
+        if ($entries === false) {
+            $stats['errors'][] = 'nie moge odczytac katalogu: ' . (($relDir === '') ? '.' : $relDir);
+            continue;
+        }
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $rel = ($relDir === '') ? $entry : $relDir . '/' . $entry;
+            if (db_sync_archive_hard_excluded($rel, $hardDirs)) {
+                continue;
+            }
+            $abs = $root . '/' . $rel;
+            if (is_dir($abs)) {
+                if (is_link($abs) || db_sync_archive_excluded($rel, $patterns, true)) {
+                    $stats['skipped']++;
+                    continue;
+                }
+                $stack[] = $rel;
+                continue;
+            }
+            if (is_link($abs) || !is_file($abs)) {
+                $stats['skipped']++;
+                continue;
+            }
+            if (substr($entry, -5) === '.part'
+                || strpos($entry, 'dbsync-list-') === 0
+                || strpos($entry, 'dbsync-log-') === 0
+                || strpos($entry, 'dbsync-status-') === 0
+                || strpos($entry, "\n") !== false
+                || strpos($entry, "\r") !== false) {
+                $stats['skipped']++;
+                continue;
+            }
+            if (db_sync_archive_excluded($rel, $patterns, false)) {
+                $stats['skipped']++;
+                continue;
+            }
+            $size = @filesize($abs);
+            $stats['files']++;
+            $stats['bytes'] += ($size === false) ? 0 : $size;
+            if (!$stats['non_ascii'] && preg_match('/[^\x00-\x7F]/', $rel)) {
+                $stats['non_ascii'] = true;
+            }
+            if ($fh !== false) {
+                fwrite($fh, $rel . "\n");
+            }
+            if ($deadline > 0 && microtime(true) > $deadline) {
+                $stats['partial'] = true;
+                break 2;
+            }
+        }
+    }
+    if ($fh !== false) {
+        fclose($fh);
+    }
+    return $stats;
+}
+
+function db_sync_archive_command($tool, $format, $bin, $listFile, $targetPart)
+{
+    $arc  = db_sync_bin_arg($bin);
+    $part = db_sync_bin_arg($targetPart);
+    $list = db_sync_bin_arg($listFile);
+    if ($tool === '7z') {
+        $type = ($format === '7z') ? '7z' : 'zip';
+        return $arc . ' a -t' . $type . ' -mx=5 -bb0 -y ' . $part . ' @' . $list;
+    }
+    if ($tool === 'zip') {
+        // Info-ZIP: nazwy plikow czytane ze stdin (-@)
+        return $arc . ' -q -9 ' . $part . ' -@ < ' . $list;
+    }
+    if ($tool === 'tar') {
+        return $arc . ' -czf ' . $part . ' -T ' . $list;
+    }
+    throw new Exception('Nieznane narzedzie archiwizujace: ' . $tool);
+}
+
+function db_sync_archive_log_tail($path, $maxBytes = 8192)
+{
+    if (!is_file($path)) {
+        return '';
+    }
+    $size = @filesize($path);
+    $fh   = @fopen($path, 'rb');
+    if ($fh === false) {
+        return '';
+    }
+    if ($size !== false && $size > $maxBytes) {
+        fseek($fh, $size - $maxBytes);
+    }
+    $data = stream_get_contents($fh);
+    fclose($fh);
+    if ($size !== false && $size > $maxBytes) {
+        $data = '[...] ' . $data;
+    }
+    return rtrim((string) $data);
+}
+
+function db_sync_archive_output_errors($text)
+{
+    $found = array();
+    if ($text === '') {
+        return $found;
+    }
+    $needles = array(
+        "Couldn't visit",
+        'cannot stat',
+        'no such file or directory',
+        'access is denied',
+        'permission denied',
+        'cannot open',
+        "can't create",
+        'cannot create',
+        'name not matched',
+        'warning:',
+    );
+    $lines = preg_split('/\r\n|\r|\n/', $text);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '') {
+            continue;
+        }
+        foreach ($needles as $needle) {
+            if (stripos($line, $needle) !== false) {
+                $found[] = $line;
+                break;
+            }
+        }
+    }
+    return array_slice(array_values(array_unique($found)), 0, 5);
+}
+
+function db_sync_archive_create($format, $patterns, $creds)
+{
+    $status = db_sync_archive_format_status();
+    if (!isset($status[$format])) {
+        throw new Exception('Nieznany format archiwum: ' . $format);
+    }
+    $st  = $status[$format];
+    $fmt = $st['fmt'];
+    if (!$st['ok']) {
+        throw new Exception('Brak narzedzia do formatu ' . $fmt['label'] . ' (wymagane: ' . implode(' / ', $fmt['tools']) . ').'
+            . ' Zainstaluj narzedzie albo podaj sciezke recznie, np. ?' . db_sync_archive_tool_arg($fmt['tools'][0]) . '=/pelna/sciezka.');
+    }
+    $tool = $st['tool'];
+    $bin  = $st['bin'];
+
+    $archiveDir = db_sync_archive_dir(true);
+    db_sync_htaccess_protect(DB_SYNC_DIR);
+    db_sync_archive_cleanup_parts();
+
+    $root     = db_sync_archive_root();
+    $hardDirs = db_sync_archive_hard_dirs();
+    $domain   = db_sync_archive_domain_key();
+    if ($domain === '') {
+        // brak zadania HTTP (np. uruchomienie z CLI) - awaryjnie nazwa bazy
+        $domain = db_sync_archive_site_key($creds);
+    }
+    db_sync_log('AKCJA', 'archiwum plikow (' . $fmt['label'] . ') serwisu: ' . $domain);
+
+    // Nazwy plikow tymczasowych sa pochodna nazwy docelowej (a nie losowe),
+    // dzieki temu osierocony plik .part da sie powiazac z logiem narzedzia
+    // i dokonczyc po przerwanym zadaniu (db_sync_archive_recover_parts).
+    $stamp      = date('ymd-His') . '-' . $domain . $fmt['ext'];
+    $target     = $archiveDir . '/' . $stamp;
+    $part       = $target . '.part';
+    $listFile   = $archiveDir . '/dbsync-list-' . $stamp . '.txt';
+    $logFile    = $archiveDir . '/dbsync-log-' . $stamp . '.txt';
+    $statusFile = $archiveDir . '/dbsync-status-' . $stamp . '.txt';
+    if (!is_writable($archiveDir)) {
+        throw new Exception('Katalog ' . $archiveDir . ' nie jest zapisywalny.');
+    }
+    db_sync_archive_unlink(array($listFile, $logFile, $statusFile, $part));
+
+    $stats = db_sync_archive_collect($root, $patterns, $hardDirs, $listFile);
+    foreach ($stats['errors'] as $err) {
+        db_sync_log('OSTRZEZENIE SKANU', $err, true);
+    }
+    if ($stats['files'] === 0) {
+        db_sync_archive_unlink(array($listFile, $logFile, $statusFile));
+        throw new Exception('Brak plikow do archiwizacji (katalog pusty albo wszystko pominiete wykluczeniami).');
+    }
+    db_sync_log('PLIKI', $stats['files'] . ' plikow, ' . db_sync_human_size($stats['bytes']) . ' danych zrodlowych'
+        . ($stats['skipped'] > 0 ? ', pominieto ' . $stats['skipped'] . ' pozycji (wykluczenia/symlinki)' : ''));
+    if (!db_sync_archive_tool_utf8_ok($tool) && $stats['non_ascii']) {
+        db_sync_archive_unlink(array($listFile, $logFile, $statusFile));
+        throw new Exception('Nazwy plikow zawieraja znaki nie-ASCII, a ' . basename($bin)
+            . ' na Windows moze je pomijac bez ostrzezenia (cichy czesciowy backup).'
+            . "\nUzyj formatu ZIP lub 7Z (obslugiwanych przez 7-Zip).");
+    }
+
+    $free = @disk_free_space($archiveDir);
+    if ($free !== false && $free < ($stats['bytes'] + 52428800)) {
+        db_sync_archive_unlink(array($listFile, $logFile, $statusFile));
+        throw new Exception('Za malo miejsca na dysku: wolne ' . db_sync_human_size($free)
+            . ', dane zrodlowe ' . db_sync_human_size($stats['bytes']) . ' (wymagany zapas 50 MB).');
+    }
+
+    $cmd = db_sync_archive_command($tool, $format, $bin, $listFile, $part);
+    db_sync_log('NARZEDZIE', basename($bin) . ' (' . $bin . ')');
+    db_sync_log('KOMENDA', $cmd . '   [cwd: ' . $root . ']');
+
+    // cwd procesu potomnego = katalog serwisu (sciezki na liscie sa wzgledne),
+    // wyjscie narzedzia -> plik logu (nie do pamieci PHP);
+    // dopisek statusu zapisuje kod wyjscia narzedzia takze po ubiciu PHP
+    $oldCwd = function_exists('getcwd') ? getcwd() : false;
+    @chdir($root);
+    db_sync_exec($cmd . ' > ' . db_sync_bin_arg($logFile) . ' 2>&1' . db_sync_archive_status_suffix($statusFile), $outIgnored, $execCode);
+    if ($oldCwd !== false) {
+        @chdir($oldCwd);
+    }
+
+    // kod wyjscia czytamy z pliku statusu - dopisane polecenia powloki
+    // zmieniaja wartosc zwracana przez exec()
+    $statusCode = db_sync_archive_status_code($statusFile);
+    $code       = ($statusCode === null) ? (int) $execCode : $statusCode;
+
+    $tail  = db_sync_archive_log_tail($logFile);
+    $found = db_sync_archive_output_errors($tail);
+    $fail  = '';
+
+    if ($tool === '7z' && preg_match('/Files read from disk:\s*(\d+)/', $tail, $m)) {
+        if ((int) $m[1] !== $stats['files']) {
+            $fail = 'Narzedzie przetworzylo ' . (int) $m[1] . ' plikow, a na liscie bylo ' . $stats['files'] . ' - archiwum jest niepelne.';
+        }
+    }
+    if ($fail === '') {
+        if ($code >= 2) {
+            $fail = 'Narzedzie zakonczylo sie bledem (kod ' . $code . ').';
+        } elseif ($code === 1 && !empty($found)) {
+            $fail = 'Narzedzie zglosilo problemy z plikami (kod 1).';
+        }
+    }
+    if ($fail !== '') {
+        if (!empty($found)) {
+            $fail .= "\n" . implode("\n", $found);
+        }
+        db_sync_archive_unlink(array($listFile, $logFile, $statusFile, $part));
+        throw new Exception($fail);
+    }
+    if ($code === 1) {
+        db_sync_log('OSTRZEZENIE', 'narzedzie zwrocilo kod 1 - sprawdz zawartosc archiwum', true);
+    }
+    foreach ($found as $line) {
+        db_sync_log('OSTRZEZENIE NARZEDZIA', $line, true);
+    }
+
+    $partSize = is_file($part) ? filesize($part) : 0;
+    if ($partSize === 0) {
+        db_sync_archive_unlink(array($listFile, $logFile, $statusFile, $part));
+        throw new Exception('Archiwum nie zostalo utworzone (brak pliku ' . basename($part) . ' lub plik pusty).'
+            . ($tail !== '' ? "\n" . $tail : ''));
+    }
+    if (!@rename($part, $target)) {
+        db_sync_archive_unlink(array($listFile, $logFile, $statusFile, $part));
+        throw new Exception('Nie moge zmienic nazwy ' . basename($part) . ' na ' . basename($target) . '.');
+    }
+
+    $percent = ($stats['bytes'] > 0) ? ' (' . round($partSize / $stats['bytes'] * 100) . '% danych zrodlowych)' : '';
+    db_sync_log('ARCHIWUM GOTOWE', db_sync_human_size($partSize) . $percent . ' -> ' . $target);
+    if ($tail !== '') {
+        db_sync_log_raw($tail);
+    }
+    db_sync_archive_unlink(array($listFile, $logFile, $statusFile));
+    return $target;
+}
+
+function db_sync_archive_ext_mime_map()
+{
+    return array(
+        '.zip'     => 'application/zip',
+        '.7z'      => 'application/x-7z-compressed',
+        '.tar.gz'  => 'application/gzip',
+        '.tar.bz2' => 'application/x-bzip2',
+        '.rar'     => 'application/vnd.rar',
+    );
+}
+
+function db_sync_archive_path($file)
+{
+    $file = basename(str_replace('\\', '/', (string) $file));
+    if ($file === '' || $file === '.' || $file === '..') {
+        return false;
+    }
+    $ok = false;
+    foreach (array_keys(db_sync_archive_ext_mime_map()) as $ext) {
+        if (strlen($file) > strlen($ext) && substr($file, -strlen($ext)) === $ext) {
+            $ok = true;
+            break;
+        }
+    }
+    if (!$ok) {
+        return false;
+    }
+    $path = DB_SYNC_ARCHIVE_DIR . '/' . $file;
+    return is_file($path) ? $path : false;
+}
+
+function db_sync_archive_list()
+{
+    $files = array();
+    if (is_dir(DB_SYNC_ARCHIVE_DIR)) {
+        foreach (glob(DB_SYNC_ARCHIVE_DIR . '/*') ?: array() as $path) {
+            $name = basename($path);
+            if (is_file($path) && db_sync_archive_path($name) !== false) {
+                $files[] = $name;
+            }
+        }
+    }
+    rsort($files);
+    return $files;
+}
+
+function db_sync_archive_mime($file)
+{
+    $name = strtolower(basename((string) $file));
+    foreach (db_sync_archive_ext_mime_map() as $ext => $mime) {
+        if (substr($name, -strlen($ext)) === $ext) {
+            return $mime;
+        }
+    }
+    return 'application/octet-stream';
+}
+
+function db_sync_download_archive($file)
+{
+    $path = db_sync_archive_path($file);
+    if ($path === false) {
+        throw new Exception('Nieprawidlowy lub nieistniejacy plik archiwum: ' . $file);
+    }
+    db_sync_send_file($path, db_sync_archive_mime($file));
+}
+
+function db_sync_delete_archives($files)
+{
+    if (empty($files) || !is_array($files)) {
+        throw new Exception('Nie zaznaczono zadnych archiwow do usuniecia.');
+    }
+    $deleted = 0;
+    foreach ($files as $file) {
+        $path = db_sync_archive_path($file);
+        if ($path === false) {
+            db_sync_log('POMINIETO', 'nieprawidlowy plik archiwum: ' . $file, true);
+            continue;
+        }
+        if (@unlink($path)) {
+            $deleted++;
+            db_sync_log('USUNIETO', basename($path));
+        } else {
+            db_sync_log('BLAD USUWANIA', 'nie moge usunac: ' . basename($path), true);
+        }
+    }
+    db_sync_log('USUWANIE GOTOWE', $deleted . ' archiw(ow) usunieto');
 }
 
 /* ------------------------------------------------------------------ */
@@ -1127,12 +2285,22 @@ if (!$authOk) {
 
 $start = microtime(true);
 $showDumpForm = false;
+$showArchiveForm = false;
 
 // pobranie dumpu - czysty plik, bez interfejsu (przed jakimkolwiek HTML)
 $pendingError = '';
 if (isset($_GET['action']) && strtolower(trim($_GET['action'])) === 'download') {
     try {
         db_sync_download(isset($_GET['file']) ? $_GET['file'] : '');
+    } catch (Exception $e) {
+        $pendingError = $e->getMessage();
+    }
+}
+
+// pobranie archiwum - czysty plik, bez interfejsu (przed jakimkolwiek HTML)
+if (isset($_GET['action']) && strtolower(trim($_GET['action'])) === 'downloadarchive') {
+    try {
+        db_sync_download_archive(isset($_GET['file']) ? $_GET['file'] : '');
     } catch (Exception $e) {
         $pendingError = $e->getMessage();
     }
@@ -1168,7 +2336,9 @@ try {
     // nawet gdy na serwerze nie znaleziono wp-config.php/parameters.php,
     // zeby zawsze mozna bylo zaktualizowac skrypt do wersji, ktora np.
     // dodaje obsluge kolejnego formatu konfiguracji.
-    $needsDbConfig = ($action !== 'checkupdate' && $action !== 'update');
+    // Akcje archiwum plikow tez nie wymagaja bazy.
+    $needsDbConfig = ($action !== 'checkupdate' && $action !== 'update'
+        && $action !== 'archive' && $action !== 'downloadarchive' && $action !== 'deletearchive');
 
     if ($needsDbConfig) {
         $dbConfig = db_sync_creds_from_disk();
@@ -1185,13 +2355,35 @@ try {
         } else {
             db_sync_log('POLACZENIE Z BAZA', $conn, true);
         }
+    } elseif ($action === 'archive') {
+        // archiwizacja nie wymaga bazy - konfiguracje czytamy tylko po to,
+        // zeby nazwac plik archiwum (DB_NAME zamiast domeny); brak configu
+        // nie jest bledem.
+        try {
+            $dbConfig = db_sync_creds_from_disk();
+            $creds = $dbConfig['creds'];
+        } catch (Exception $e) {
+            // zostaja puste dane - nazwa z HTTP_HOST (db_sync_archive_site_key)
+        }
     }
 
     if (($action === 'dump' || $action === 'sync') && ($creds['DB_NAME'] === '' || $creds['DB_USER'] === '')) {
         throw new Exception('Nie udalo sie odczytac danych bazy z konfiguracji (DB_NAME/DB_USER) - nie moge wykonac akcji.');
     }
 
-    if ($action === 'dump') {
+    if ($action === 'archive') {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $format   = isset($_POST['format']) ? trim($_POST['format']) : '';
+            $patterns = db_sync_archive_exclude_clean(isset($_POST['exclude']) ? $_POST['exclude'] : '');
+            db_sync_archive_exclude_save(db_sync_archive_site_key($creds), $patterns);
+            db_sync_archive_create($format, $patterns, $creds);
+        } else {
+            db_sync_archive_cleanup_parts();
+            $showArchiveForm = true;
+        }
+    } elseif ($action === 'deletearchive') {
+        db_sync_delete_archives(isset($_POST['archives']) && is_array($_POST['archives']) ? $_POST['archives'] : array());
+    } elseif ($action === 'dump') {
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $exclude = isset($_POST['exclude']) ? $_POST['exclude'] : array();
             $exclude = db_sync_clean_exclude_list($exclude);
@@ -1258,6 +2450,8 @@ flush();
 // lista z przyciskami - widoczna zawsze pod logiem
 if ($showDumpForm) {
     db_sync_render_dump_form($creds, $host, $port);
+} elseif ($showArchiveForm) {
+    db_sync_render_archive_form($creds);
 } else {
     db_sync_render_list();
 }
