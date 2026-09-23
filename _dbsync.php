@@ -119,7 +119,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.10.1');
+define('DBSYNC_VERSION', '1.10.2');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -1529,9 +1529,12 @@ function db_sync_archive_default_exclude()
         // (patrz db_sync_archive_hard_dirs).
         '_dbsync/',
         '_dbsync.php',
+        '_sar3/',
+        '_sar4/',
         '.git/',
         '.svn/',
         'node_modules/',
+        'cgi/',
         'cache/',
         'var/cache/',
         'wp-content/cache/',
