@@ -116,7 +116,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.8.1');
+define('DBSYNC_VERSION', '1.8.2');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -2237,9 +2237,9 @@ function db_sync_remote_script()
 function db_sync_remote_script_from_tarball()
 {
     try {
-        // ?t= to tylko asekuracja na posrednie cache (codeload co prawda nie
-        // wysyla naglowkow cache, ale chwile po pushu zdarzyl sie zwrocic
-        // starsze archiwum); sprawdzone - przyjmuje parametr i zwraca 200.
+        // ?t= nie omija propagacji archiwum po stronie GitHuba (ta trwa
+        // kilkanascie(?) sekund po pushu), ale chroni przed ewentualnym
+        // posrednim cache (proxy/CDN) po drodze; sprawdzone - 200 OK.
         $gz = db_sync_http_get(DBSYNC_GITHUB_TARBALL_URL . '?t=' . time(), 20);
     } catch (Exception $e) {
         return false;
@@ -2573,7 +2573,8 @@ try {
                 . '<b>Dostepna aktualizacja do wersji ' . htmlspecialchars($latest) . '</b> ' . $updBtn
                 . '</div>' . "\n";
         } elseif (version_compare($latest, DBSYNC_VERSION, '<')) {
-            db_sync_log('AKTUALIZACJA', 'GitHub main ma starsza wersje (' . $latest . ') niz lokalna (' . DBSYNC_VERSION . ') - lokalny plik jest nowszy (wydanie nie wypchniete?).');
+            db_sync_log('AKTUALIZACJA', 'GitHub main ma starsza wersje (' . $latest . ') niz lokalna (' . DBSYNC_VERSION . ') - lokalny plik jest nowszy (wydanie nie wypchniete?).'
+                . ' Jezeli wydanie wlasnie zostalo wypchniete, GitHub moze jeszcze przez chwile zwracac starsze archiwum - sprawdz za minute.');
         } elseif (db_sync_body_same_as_local($body)) {
             db_sync_log('AKTUALIZACJA', 'Brak nowszej wersji (GitHub main: ' . $latest . ', obecna: ' . DBSYNC_VERSION . ')');
         } else {
@@ -2589,7 +2590,8 @@ try {
             throw new Exception('Pobrany plik nie zawiera stalej DBSYNC_VERSION - nie podmieniam.');
         }
         if (version_compare($newVersion, DBSYNC_VERSION, '<')) {
-            throw new Exception('Pobrana wersja ' . $newVersion . ' jest starsza niz zainstalowana ' . DBSYNC_VERSION . ' - nie podmieniam.');
+            throw new Exception('Pobrana wersja ' . $newVersion . ' jest starsza niz zainstalowana ' . DBSYNC_VERSION . ' - nie podmieniam.'
+                . ' Jezeli wydanie wlasnie zostalo wypchniete, GitHub moze jeszcze przez chwile zwracac starsze archiwum - sprobuj za minute.');
         }
         db_sync_apply_update($body);
         db_sync_log('AKTUALIZACJA', 'Zainstalowano wersje ' . $newVersion . ' - odswiez strone (F5).');
