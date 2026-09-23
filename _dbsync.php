@@ -49,8 +49,10 @@
  *
  * Wykluczenia archiwum sa edytowalne w formularzu (plik
  * _dbsyncf/archive-exclude-{site}.txt). Domyslnie wykluczone sa m.in.
- * _dbsync/ (dumpy bazy), _dbsyncf/ (archiwa) i _dbsync.php (sam skrypt
- * narzedzia) - usuniecie wzorca z listy oznacza dolaczenie do archiwum.
+ * _dbsync/ (dumpy bazy) i _dbsync.php (sam skrypt narzedzia) - usuniecie
+ * wzorca z listy oznacza dolaczenie do archiwum. Katalog archiwow
+ * (DB_SYNC_ARCHIVE_DIR, domyslnie _dbsyncf/) jest pomijany bezwarunkowo
+ * i nie ma go na liscie wzorcow, bo nie da sie go dolaczyc do archiwum.
  * Przycisk "Ustaw domyslne" obok listy przywraca pelny zestaw wzorcow
  * domyslnych (nadpisuje plik wykluczen, archiwum nie powstaje).
  *
@@ -116,7 +118,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.8.2');
+define('DBSYNC_VERSION', '1.9.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -609,14 +611,11 @@ function db_sync_render_archive_form($creds)
         . '</p>';
     echo '<p style="margin:0 0 4px;color:#555">Bezwarunkowo pominiete: <b>'
         . (empty($hardDirs) ? 'brak' : htmlspecialchars(implode(', ', $hardDirs)))
-        . '</b> (katalog archiwow - archiwa nie trafiaja do archiwum).</p>';
+        . '</b> (katalog archiwow - archiwa nie trafiaja do archiwum i nie ma go na liscie wzorcow ponizej, bo nie da sie go dolaczyc).</p>';
     // wzorce edytowalne: pokazujemy, co jest aktualnie wykluczone, a co dolaczone
     $exclManaged = array();
     $inclManaged = array();
     foreach (db_sync_archive_managed_exclude() as $managed) {
-        if ($managed === '_dbsyncf/') {
-            continue; // katalog archiwow jest pomijany bezwarunkowo
-        }
         if (db_sync_archive_exclude_has($patterns, $managed)) {
             $exclManaged[] = $managed;
         } else {
@@ -1120,7 +1119,9 @@ function db_sync_archive_hard_dirs()
     // Bezwarunkowo (poza lista wykluczen, ktora jest edytowalna) pomijany jest
     // tylko katalog, do ktorego trafia samo archiwum - inaczej archiwum
     // pakowaloby poprzednie archiwa (i wlasny plik tymczasowy *.part).
-    // Katalog _dbsync (dumpy bazy) jest zwyklym wzorcem w wykluczeniach.
+    // Katalog _dbsync (dumpy bazy) jest zwyklym wzorcem w wykluczeniach,
+    // a katalogu archiwow nie ma na liscie wzorcow domyslnych (patrz
+    // db_sync_archive_default_exclude) - i tak nie da sie go dolaczyc.
     $root = db_sync_archive_root();
     $out  = array();
     $arc  = rtrim(str_replace('\\', '/', DB_SYNC_ARCHIVE_DIR), '/');
@@ -1515,10 +1516,11 @@ function db_sync_archive_tool_utf8_ok($tool)
 function db_sync_archive_default_exclude()
 {
     return array(
-        // dumpy bazy, archiwa i sam skrypt narzedzia - wzorce edytowalne:
-        // usuniecie wzorca z listy oznacza dolaczenie do archiwum
+        // dumpy bazy i sam skrypt narzedzia - wzorce edytowalne: usuniecie
+        // wzorca z listy oznacza dolaczenie do archiwum. Katalogu archiwow
+        // (_dbsyncf/) nie ma na liscie, bo i tak jest pomijany bezwarunkowo
+        // (patrz db_sync_archive_hard_dirs).
         '_dbsync/',
-        '_dbsyncf/',
         '_dbsync.php',
         '.git/',
         '.svn/',
@@ -1537,7 +1539,7 @@ function db_sync_archive_default_exclude()
    migracji (patrz db_sync_archive_exclude_load). */
 function db_sync_archive_managed_exclude()
 {
-    return array('_dbsync/', '_dbsyncf/', '_dbsync.php');
+    return array('_dbsync/', '_dbsync.php');
 }
 
 function db_sync_archive_exclude_path($site)
@@ -1551,13 +1553,14 @@ function db_sync_archive_exclude_path($site)
    brakujacych wzorcow systemowych. */
 function db_sync_archive_exclude_marker()
 {
-    return '# dbsync-exclude-v3';
+    return '# dbsync-exclude-v4';
 }
 
 /* Wzorce dopisywane przy migracji - zaleznie od wersji pliku:
    brak znacznika  = plik z wersji <= 1.3.1 (_dbsync/ i _dbsyncf/ byly
                      wtedy wykluczone na sztywno),
-   znacznik v2     = plik z 1.4.0 (dochodzi tylko wzorzec samego skryptu). */
+   znacznik v2     = plik z 1.4.0 (dochodzi tylko wzorzec samego skryptu),
+   znacznik v3     = plik z 1.5.0-1.8.2 (nic nie dopisujemy). */
 function db_sync_archive_exclude_migration($text)
 {
     if (strpos($text, '# dbsync-exclude-') === false) {
@@ -1565,6 +1568,20 @@ function db_sync_archive_exclude_migration($text)
     }
     if (strpos($text, '# dbsync-exclude-v2') !== false) {
         return array('_dbsync.php');
+    }
+    return array();
+}
+
+/* Wzorce usuwane przy migracji: pliki z wersji <= 1.8.2 mialy na liscie
+   wzorzec _dbsyncf/, choc katalog archiwow jest pomijany bezwarunkowo
+   (patrz db_sync_archive_hard_dirs) - wpis byl wiec zbedny i sugerowal, ze
+   mozna go usunac, aby dolaczyc archiwa do archiwum. Usuwamy go tylko wtedy,
+   gdy rzeczywiscie wskazuje katalog archiwow; gdy archiwa leza gdzie indziej
+   (zmieniona stala DB_SYNC_ARCHIVE_DIR), wzorzec zostaje bez zmian. */
+function db_sync_archive_exclude_migration_remove()
+{
+    if (db_sync_archive_exclude_has(db_sync_archive_hard_dirs(), '_dbsyncf/')) {
+        return array('_dbsyncf/');
     }
     return array();
 }
@@ -1615,17 +1632,32 @@ function db_sync_archive_exclude_load($site)
     // wzorca przez uzytkownika (np. _dbsync/ albo _dbsync.php, aby dolaczyc
     // dumpy albo sam skrypt do archiwum) jest respektowane.
     if (strpos($text, db_sync_archive_exclude_marker()) === false) {
-        $added = array();
+        $added   = array();
+        $removed = array();
         foreach (db_sync_archive_exclude_migration($text) as $extra) {
             if (!db_sync_archive_exclude_has($lines, $extra)) {
                 $lines[] = $extra;
                 $added[] = $extra;
             }
         }
+        $drop = db_sync_archive_exclude_migration_remove();
+        if (!empty($drop)) {
+            foreach ($lines as $i => $line) {
+                if (db_sync_archive_exclude_has($drop, $line)) {
+                    unset($lines[$i]);
+                    $removed[] = $line;
+                }
+            }
+            $lines = array_values($lines);
+        }
         try {
             db_sync_archive_exclude_save($site, $lines);
             if (!empty($added)) {
                 db_sync_log('MIGRACJA WYKLUCZEN', 'dopisano wzorce: ' . implode(', ', $added));
+            }
+            if (!empty($removed)) {
+                db_sync_log('MIGRACJA WYKLUCZEN', 'usunieto zbedne wzorce: ' . implode(', ', $removed)
+                    . ' (katalog archiwow jest pomijany bezwarunkowo)');
             }
         } catch (Exception $e) {
             db_sync_log('OSTRZEZENIE', 'nie moge zapisac migracji wykluczen: ' . $e->getMessage(), true);
