@@ -17,6 +17,8 @@
  *   _dbsync.php?action=delete (POST files[]) -> usuniecie zaznaczonych plikow
  *   _dbsync.php?action=archive (GET)  -> formularz archiwum plikow serwisu
  *   _dbsync.php?action=archive (POST) -> utworzenie archiwum w ./_dbsyncf/
+ *   _dbsync.php?action=archive (POST exclude_defaults=1) -> przywrocenie
+ *                                 domyslnej listy wykluczen (bez archiwum)
  *   _dbsync.php?action=downloadarchive&file=NAZWA -> pobranie archiwum
  *   _dbsync.php?action=deletearchive (POST archives[]) -> usuniecie archiwow
  *
@@ -48,6 +50,8 @@
  * _dbsyncf/archive-exclude-{site}.txt). Domyslnie wykluczone sa m.in.
  * _dbsync/ (dumpy bazy), _dbsyncf/ (archiwa) i _dbsync.php (sam skrypt
  * narzedzia) - usuniecie wzorca z listy oznacza dolaczenie do archiwum.
+ * Przycisk "Ustaw domyslne" obok listy przywraca pelny zestaw wzorcow
+ * domyslnych (nadpisuje plik wykluczen, archiwum nie powstaje).
  *
  * Archiwum powstaje najpierw jako plik *.part i dopiero po sprawdzeniu
  * wyniku jest przemianowywane na nazwe docelowa (YYMMDD-HHMMSS-{domena}.{ext}).
@@ -111,7 +115,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa aktualizacje (tagi vX.Y.Z). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.5.0');
+define('DBSYNC_VERSION', '1.6.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -651,8 +655,14 @@ function db_sync_render_archive_form($creds)
             . '</div>';
     }
     echo '<p style="margin:12px 0 4px">Wykluczenia (jeden wzorzec na linie; katalog konczy "/", np. <b>cache/</b>; wzorce z gwiazdka, np. <b>*.log</b>):</p>'
-        . '<textarea name="exclude" rows="8" cols="60" style="font-family:Consolas,monospace;font-size:13px;padding:6px">'
+        // field-sizing:content (Chrome 123+) rozciaga pole do zawartosci;
+        // rows/cols zostaja jako rozmiar zastepczy dla starszych przegladarek
+        . '<textarea name="exclude" rows="8" cols="60" spellcheck="false" style="font-family:Consolas,monospace;font-size:13px;padding:6px;box-sizing:border-box;min-width:32em;max-width:100%;min-height:7em;max-height:60vh;resize:vertical;field-sizing:content">'
         . htmlspecialchars(implode("\n", $patterns)) . '</textarea>';
+    echo '<p style="margin:8px 0 0">'
+        . '<button type="submit" name="exclude_defaults" value="1" onclick="return confirm(\'Przywrocic domyslna liste wykluczen?\nWzorce zapisza sie od razu (archiwum nie powstanie).\');" style="font-family:Consolas,monospace;font-size:13px;padding:6px 12px;cursor:pointer;background:#eee;border:1px solid #ccc;border-radius:4px">Ustaw domyslne</button>'
+        . ' <small style="color:#888">przywraca pelny zestaw wzorcow domyslnych</small>'
+        . '</p>';
     echo '<p style="margin:12px 0 0">';
     if ($default !== '') {
         echo '<button type="submit" onclick="return dbsyncArchiveConfirm(this);" style="font-family:Consolas,monospace;font-size:14px;padding:8px 14px;cursor:pointer;background:#0a7;color:#fff;border:0;border-radius:4px">Utworz archiwum</button>';
@@ -1640,6 +1650,36 @@ function db_sync_archive_exclude_save($site, $lines)
     db_sync_log('WYKLUCZENIA ZAPISANE', basename($path) . ' (' . count($clean) . ' wzorcow)');
 }
 
+/* Przywrocenie domyslnej listy wykluczen (przycisk "Ustaw domyslne"):
+   nadpisuje plik wykluczen wzorcami z db_sync_archive_default_exclude()
+   i raportuje roznice wzgledem stanu poprzedniego. */
+function db_sync_archive_exclude_reset($site)
+{
+    $before = db_sync_archive_exclude_load($site);
+    $after  = db_sync_archive_default_exclude();
+    $added   = array();
+    $removed = array();
+    foreach ($after as $pattern) {
+        if (!db_sync_archive_exclude_has($before, $pattern)) {
+            $added[] = $pattern;
+        }
+    }
+    foreach ($before as $pattern) {
+        if (!db_sync_archive_exclude_has($after, $pattern)) {
+            $removed[] = $pattern;
+        }
+    }
+    db_sync_archive_exclude_save($site, $after);
+    db_sync_log('WYKLUCZENIA DOMYSLNE', 'przywrocono zestaw domyslny (' . count($after) . ' wzorcow)');
+    if (!empty($added)) {
+        db_sync_log('WYKLUCZENIA DOMYSLNE', 'dopisano wzorce: ' . implode(', ', $added));
+    }
+    if (!empty($removed)) {
+        db_sync_log('WYKLUCZENIA DOMYSLNE', 'usunieto wzorce: ' . implode(', ', $removed), true);
+    }
+    return $after;
+}
+
 function db_sync_archive_excluded($rel, $patterns, $isDir = false)
 {
     $rel  = str_replace('\\', '/', $rel);
@@ -2373,10 +2413,17 @@ try {
 
     if ($action === 'archive') {
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
-            $format   = isset($_POST['format']) ? trim($_POST['format']) : '';
-            $patterns = db_sync_archive_exclude_clean(isset($_POST['exclude']) ? $_POST['exclude'] : '');
-            db_sync_archive_exclude_save(db_sync_archive_site_key($creds), $patterns);
-            db_sync_archive_create($format, $patterns, $creds);
+            $site = db_sync_archive_site_key($creds);
+            if (isset($_POST['exclude_defaults'])) {
+                // przycisk "Ustaw domyslne": zapis listy domyslnej bez archiwum
+                db_sync_archive_exclude_reset($site);
+                $showArchiveForm = true;
+            } else {
+                $format   = isset($_POST['format']) ? trim($_POST['format']) : '';
+                $patterns = db_sync_archive_exclude_clean(isset($_POST['exclude']) ? $_POST['exclude'] : '');
+                db_sync_archive_exclude_save($site, $patterns);
+                db_sync_archive_create($format, $patterns, $creds);
+            }
         } else {
             db_sync_archive_cleanup_parts();
             $showArchiveForm = true;
