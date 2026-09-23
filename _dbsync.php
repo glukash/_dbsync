@@ -25,7 +25,7 @@
  * Nazwa archiwum: YYMMDD-HHMMSS-{domena}.{ext}, np. 260923-103115-example.com.zip
  * (domena z zadania HTTP; przy braku - awaryjnie nazwa bazy).
  *   _dbsync.php?action=checkupdate    -> sprawdzenie nowszej wersji na GitHubie
- *                                        (raw.githubusercontent.com, branch main)
+ *                                        (branch main, archiwum tar.gz z codeload)
  *   _dbsync.php?action=update         -> pobranie i zainstalowanie nowszej wersji
  *
  * Dane dostepowe do bazy (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) sa
@@ -116,7 +116,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.7.0');
+define('DBSYNC_VERSION', '1.8.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -2112,10 +2112,14 @@ function db_sync_delete_archives($files)
 /* Aktualizacje (GitHub)                                               */
 /* ------------------------------------------------------------------ */
 
-/* Sprawdzanie wersji i pobieranie pliku korzystaja z tego samego zrodla -
-   surowego pliku z brancha main. Nie uzywamy api.github.com: limit 60
-   zapytan/h liczy sie per IP i na hostingu wspoldzielonym (np.
-   s124.cyber-folks.pl) konczyl sie bledem HTTP 403 przy checkupdate. */
+/* Sprawdzanie wersji i pobieranie pliku korzystaja z tego samego zrodla:
+   swiezego archiwum brancha main z codeload.github.com. Nie uzywamy
+   api.github.com (limit 60 zapytan/h per IP - na hostingu wspoldzielonym,
+   np. s124.cyber-folks.pl, konczyl sie bledem HTTP 403 przy checkupdate)
+   ani raw.githubusercontent.com jako zrodla glownego - jego CDN potrafi
+   zwracac plik sprzed kilku minut (Cache-Control: max-age=300, parametr
+   w URL NIE omija cache). Raw zostaje jako awaryjny fallback. */
+define('DBSYNC_GITHUB_TARBALL_URL', 'https://codeload.github.com/' . DBSYNC_GITHUB_REPO . '/tar.gz/refs/heads/' . DBSYNC_GITHUB_BRANCH);
 define('DBSYNC_GITHUB_RAW_URL', 'https://raw.githubusercontent.com/' . DBSYNC_GITHUB_REPO . '/' . DBSYNC_GITHUB_BRANCH . '/_dbsync.php');
 
 function db_sync_http_get($url, $timeout = 10)
@@ -2217,14 +2221,68 @@ function db_sync_shorten_text($text, $len = 300)
 
 function db_sync_remote_script()
 {
-    // CDN raw.githubusercontent.com trzyma plik w cache ok. 5 minut - zmienny
-    // parametr w URL wymusza pobranie zawsze swiezej wersji (ma znaczenie
-    // zaraz po wypchnieciu wydania na GitHub).
-    $body = db_sync_http_get(DBSYNC_GITHUB_RAW_URL . '?t=' . time());
+    // 1) archiwum tar.gz z codeload.github.com - zawsze swieze, bez limitow API
+    $body = db_sync_remote_script_from_tarball();
+    if ($body === false) {
+        // 2) awaryjnie raw.githubusercontent.com (CDN moze zwrocic plik
+        //    sprzed kilku minut - zmienny parametr w URL tego nie omija)
+        $body = db_sync_http_get(DBSYNC_GITHUB_RAW_URL);
+    }
     if (stripos(ltrim($body), '<?php') !== 0) {
         throw new Exception('Pobrany plik nie zaczyna sie od <?php - to nie jest skrypt _dbsync.php.');
     }
     return $body;
+}
+
+function db_sync_remote_script_from_tarball()
+{
+    try {
+        $gz = db_sync_http_get(DBSYNC_GITHUB_TARBALL_URL, 20);
+    } catch (Exception $e) {
+        return false;
+    }
+    $tar = false;
+    if (function_exists('gzdecode')) {
+        $tar = @gzdecode($gz);
+    }
+    if ($tar === false && strlen($gz) > 18) {
+        // reczne rozpakowanie gzip: naglowek 10 B + trailer 8 B
+        $tar = @gzinflate(substr($gz, 10, -8));
+    }
+    if (!is_string($tar) || $tar === '') {
+        return false;
+    }
+    return db_sync_tar_extract($tar, '_dbsync.php');
+}
+
+/* Minimalny czytnik tar (ustar/pax) - zwraca zawartosc pierwszego pliku,
+   ktorego nazwa konczy sie na $suffix, albo false. */
+function db_sync_tar_extract($tar, $suffix)
+{
+    $pos  = 0;
+    $size = strlen($tar);
+    while ($pos + 512 <= $size) {
+        $header = substr($tar, $pos, 512);
+        $name   = rtrim(substr($header, 0, 100), "\0");
+        if ($name === '') {
+            break; // blok zerowy = koniec archiwum
+        }
+        $sizeField = trim(substr($header, 124, 12), "\0 ");
+        $fileSize  = $sizeField === '' ? 0 : (int) octdec($sizeField);
+        $typeFlag  = substr($header, 156, 1);
+        $prefix    = rtrim(substr($header, 345, 155), "\0");
+        if ($prefix !== '') {
+            $name = $prefix . '/' . $name;
+        }
+        $pos += 512;
+        if (($typeFlag === '0' || $typeFlag === "\0" || $typeFlag === '')
+            && substr($name, -strlen($suffix)) === $suffix
+        ) {
+            return substr($tar, $pos, $fileSize);
+        }
+        $pos += (int) (ceil($fileSize / 512) * 512);
+    }
+    return false;
 }
 
 /* Czy pobrany skrypt jest identyczny z lokalnym plikiem (CRLF/LF bez znaczenia).
