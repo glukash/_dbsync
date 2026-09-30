@@ -119,7 +119,7 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
 define('DBSYNC_DATE', '2026-09-30');
-define('DBSYNC_VERSION', '1.10.3');
+define('DBSYNC_VERSION', '1.10.4');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -1131,7 +1131,56 @@ function db_sync_archive_root()
             $root = ($cwd !== '' && $cwd !== '/') ? $cwd : '.';
         }
     }
-    return $root;
+    // Sprowadzenie do formy absolutnej: z docroot='/' root bywa wzgledny
+    // ('.'), a stala DB_SYNC_ARCHIVE_DIR liczona jest z surowej, absolutnej
+    // sciezki katalogu - bez wspolnej podstawy db_sync_archive_hard_dirs
+    // nie wykrylby katalogu archiwow pod rootem (trafial do archiwum!).
+    return db_sync_archive_abs($root);
+}
+
+/* Sprowadza sciezke do formy absolutnej (do porownan prefiksu):
+   - zamienia \ na /,
+   - rozpoznaje litere dysku (Windows),
+   - sciezki wzgledne dopina biezacym katalogiem procesu (getcwd); dla
+     php-cgi jest to zwykle katalog skryptu, wiec '.' sprowadza sie do
+     tej samej podstawy, z ktorej liczona jest stala DB_SYNC_ARCHIVE_DIR,
+   - porzadkuje '//' i '/.'.
+   Nie rozwiazuje symlinkow (porownanie tekstowe, jak we wczesniejszych
+   wersjach). Sciezka pusta daje korzen '/'. */
+function db_sync_archive_abs($path)
+{
+    $path = rtrim(str_replace('\\', '/', (string) $path), '/');
+    if ($path === '') {
+        return '/';
+    }
+    $drive = '';
+    if (preg_match('/^([A-Za-z]:)(.*)$/', $path, $m)) {
+        $drive = strtoupper($m[1]);
+        $path  = rtrim($m[2], '/');
+    }
+    if (substr($path, 0, 1) !== '/') {
+        $cwd = function_exists('getcwd') ? getcwd() : false;
+        $cwd = is_string($cwd) ? str_replace('\\', '/', $cwd) : '';
+        if ($cwd !== '' && $cwd !== '/') {
+            $cd = '';
+            if (preg_match('/^([A-Za-z]:)(.*)$/', $cwd, $m2)) {
+                $cd = strtoupper($m2[1]);
+                $cwd = rtrim($m2[2], '/');
+            }
+            if ($drive === '') {
+                $drive = $cd;
+            }
+            $path = $cwd . '/' . $path;
+        } elseif ($cwd === '/') {
+            // korzen systemu plikow (docroot='/', chroot): '.' znaczy '/'
+            $path = '/' . $path;
+        }
+        // brak getcwd (i korzenia) -> zostaje sciezka wzgledna (fallback)
+    }
+    $path = preg_replace('/\/+/', '/', $path);
+    $path = preg_replace('/\/\.(?=\/|$)/', '/', $path);
+    $out  = $drive . rtrim($path, '/');
+    return ($out === '') ? (($drive !== '') ? $drive . '/' : '/') : $out;
 }
 
 function db_sync_archive_hard_dirs()
@@ -1142,10 +1191,14 @@ function db_sync_archive_hard_dirs()
     // Katalog _dbsync (dumpy bazy) jest zwyklym wzorcem w wykluczeniach,
     // a katalogu archiwow nie ma na liscie wzorcow domyslnych (patrz
     // db_sync_archive_default_exclude) - i tak nie da sie go dolaczyc.
-    $root = db_sync_archive_root();
+    // Oba argumenty przez db_sync_archive_abs: przy docroot='/' root bywa
+    // wzgledny ('.') i bez wspolnej podstawy prefiks nie zostalby wykryty.
+    // Root '/' (docroot = korzen, np. chroot) obejmuje wtedy wszystko.
+    $root = db_sync_archive_abs(db_sync_archive_root());
     $out  = array();
-    $arc  = rtrim(str_replace('\\', '/', DB_SYNC_ARCHIVE_DIR), '/');
-    if ($arc !== '' && $arc !== $root && strpos($arc . '/', $root . '/') === 0) {
+    $arc  = db_sync_archive_abs(DB_SYNC_ARCHIVE_DIR);
+    if ($arc !== '' && $arc !== $root
+        && ($root === '/' || strpos($arc . '/', $root . '/') === 0)) {
         $rel = trim(substr($arc, strlen($root)), '/');
         if ($rel !== '') {
             $out[] = $rel;
