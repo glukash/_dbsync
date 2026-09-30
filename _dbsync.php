@@ -118,8 +118,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
-define('DBSYNC_DATE', '2026-09-23');
-define('DBSYNC_VERSION', '1.10.2');
+define('DBSYNC_DATE', '2026-09-30');
+define('DBSYNC_VERSION', '1.10.3');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -1112,7 +1112,26 @@ function db_sync_delete($files)
 
 function db_sync_archive_root()
 {
-    return rtrim(str_replace('\\', '/', __DIR__), '/');
+    $root = rtrim(str_replace('\\', '/', __DIR__), '/');
+    if ($root === '') {
+        // Magiczna stala katalogu bywa pusta, gdy skrypt lezy w korzeniu
+        // systemu plikow (docroot = '/', np. konto chrootowane) albo jest
+        // ladowany przez wrapper bez sciezki. scandir('') na PHP 8 rzuca
+        // ValueError (Fatal error - poza zasiegiem @ i try/catch), dlatego
+        // root nigdy nie moze byc pusty: awaryjnie katalog z __FILE__
+        // (realpath), potem cwd procesu php-cgi (CGI SAPI ustawia cwd =
+        // katalog skryptu).
+        $real = function_exists('realpath') ? @realpath(str_replace('\\', '/', __FILE__)) : false;
+        if (is_string($real) && $real !== '') {
+            $root = rtrim(str_replace('\\', '/', dirname($real)), '/');
+        }
+        if ($root === '') {
+            $cwd  = function_exists('getcwd') ? getcwd() : false;
+            $cwd  = is_string($cwd) ? rtrim(str_replace('\\', '/', $cwd), '/') : '';
+            $root = ($cwd !== '' && $cwd !== '/') ? $cwd : '.';
+        }
+    }
+    return $root;
 }
 
 function db_sync_archive_hard_dirs()
@@ -1793,6 +1812,10 @@ function db_sync_archive_collect($root, $patterns, $hardDirs, $listFile = '', $m
     while (!empty($stack)) {
         $relDir  = array_pop($stack);
         $absDir  = ($relDir === '') ? $root : $root . '/' . $relDir;
+        if ($absDir === '') {
+            $stats['errors'][] = 'nie moge ustalic katalogu zrodlowego (puste stale sciezki - skrypt w korzeniu systemu plikow?)';
+            break;
+        }
         $entries = @scandir($absDir);
         if ($entries === false) {
             $stats['errors'][] = 'nie moge odczytac katalogu: ' . (($relDir === '') ? '.' : $relDir);
