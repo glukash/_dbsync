@@ -41,12 +41,21 @@
  *   _dbsync.php?action=sync&MYSQL=/sciezka/mysql
  *   _dbsync.php?action=archive&7Z=/sciezka/7z (albo &ZIP=... / &TAR=...)
  *
+ * Gdy funkcje uruchamiania procesow (exec/proc_open/system/passthru/
+ * shell_exec/popen) sa wylaczone albo nie ma binarek, skrypt korzysta
+ * z wbudowanych mechanizmow PHP:
+ *   - dump i import bazy: mysqli (albo PDO MySQL),
+ *   - archiwum plikow: ZIP przez ZipArchive albo wlasny writer ZIP.
+ * Tryb PHP jest automatyczny i nie zmienia zachowania, gdy CLI dziala.
+ *
  * Archiwa plikow tworzone sa narzedziami systemowymi: ZIP przez Info-ZIP
  * 'zip' (na Linux - natywny narzedziem serwera; zapasowo 7-Zip) albo przez
  * 7-Zip (na Windows, gdzie poprawnie obsluguje polskie znaki), 7Z przez
- * 7-Zip, TAR.GZ przez tar. Narzedzia sa wykrywane automatycznie (PATH
- * + znane katalogi), a archiwa zapisywane w ./_dbsyncf/ - katalog ten mozna
- * wskazac poza docroot zmieniajac stala DB_SYNC_ARCHIVE_DIR.
+ * 7-Zip, TAR.GZ przez tar. Gdy CLI jest niedostepne, ZIP tworzy wbudowany
+ * mechanizm PHP (ZipArchive albo wlasny writer ZIP). Narzedzia sa wykrywane
+ * automatycznie (PATH + znane katalogi), a archiwa zapisywane w ./_dbsyncf/ -
+ * katalog ten mozna wskazac poza docroot zmieniajac stala
+ * DB_SYNC_ARCHIVE_DIR.
  *
  * Wykluczenia archiwum sa edytowalne w formularzu (plik
  * _dbsyncf/archive-exclude-{site}.txt). Domyslnie wykluczone sa m.in.
@@ -118,8 +127,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
-define('DBSYNC_DATE', '2026-09-30');
-define('DBSYNC_VERSION', '1.10.4');
+define('DBSYNC_DATE', '2026-11-05');
+define('DBSYNC_VERSION', '1.11.0');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -153,14 +162,210 @@ function db_sync_mask_password($cmd)
     return preg_replace('/--password=\S+/', '--password=***', $cmd);
 }
 
+/* Zwraca nazwe pierwszej dostepnej funkcji uruchamiania procesow albo ''.
+   Kolejnosc: exec (zachowanie historyczne), potem bezpieczne zamienniki.
+   Dzieki temu serwer z disable_functions=exec, ale z proc_open/system,
+   nadal obsluguje CLI bez zmiany sciezek native. */
+function db_sync_process_runner()
+{
+    static $runner = null;
+    if ($runner !== null) {
+        return $runner;
+    }
+    $names = array('exec', 'proc_open', 'system', 'passthru', 'shell_exec', 'popen');
+    foreach ($names as $name) {
+        if ($name === 'proc_open'
+            && (!function_exists('proc_get_status') || !function_exists('proc_close')
+                || !function_exists('fclose') || !function_exists('stream_get_contents'))) {
+            continue;
+        }
+        if ($name === 'popen' && !function_exists('pclose')) {
+            continue;
+        }
+        if (function_exists($name)) {
+            $runner = $name;
+            return $runner;
+        }
+    }
+    $runner = '';
+    return $runner;
+}
+
+function db_sync_process_available()
+{
+    return db_sync_process_runner() !== '';
+}
+
+/* Zamienia tekst wyjsciowy na format tablicy zwracany przez exec():
+   linie bez koncowych znakow nowej linii, bez pustej linii na koncu. */
+function db_sync_exec_output_lines($text)
+{
+    $text = (string) $text;
+    if ($text === '') {
+        return array();
+    }
+    $lines = preg_split('/\r\n|\r|\n/', $text);
+    if (!empty($lines) && end($lines) === '') {
+        array_pop($lines);
+    }
+    foreach ($lines as $i => $line) {
+        $lines[$i] = rtrim($line);
+    }
+    return $lines;
+}
+
+/* proc_open: czyta stdout i stderr bez blokowania (dziala tez na Windows,
+   gdzie stream_select bywa zawodny dla potokow). Wszystkie komendy skryptu
+   i tak przekierowuja stderr do stdout lub do pliku logu. */
+function db_sync_exec_proc_open($cmd, &$output, &$code)
+{
+    $descriptors = array(
+        0 => array('pipe', 'r'),
+        1 => array('pipe', 'w'),
+        2 => array('pipe', 'w'),
+    );
+    $proc = @proc_open($cmd, $descriptors, $pipes);
+    if (!is_resource($proc)) {
+        throw new Exception('Nie moge uruchomic procesu (proc_open).');
+    }
+    fclose($pipes[0]);
+    @stream_set_blocking($pipes[1], false);
+    @stream_set_blocking($pipes[2], false);
+    $stdout = '';
+    $stderr = '';
+    $exitCode = null;
+    $deadline = microtime(true) + 86400;
+    while (true) {
+        $chunk = @stream_get_contents($pipes[1]);
+        if ($chunk !== false && $chunk !== '') {
+            $stdout .= $chunk;
+        }
+        $chunk = @stream_get_contents($pipes[2]);
+        if ($chunk !== false && $chunk !== '') {
+            $stderr .= $chunk;
+        }
+        $status = @proc_get_status($proc);
+        if (!is_array($status)) {
+            break;
+        }
+        if (!$status['running']) {
+            $exitCode = isset($status['exitcode']) ? (int) $status['exitcode'] : -1;
+            break;
+        }
+        if (microtime(true) > $deadline) {
+            if (function_exists('proc_terminate')) {
+                @proc_terminate($proc);
+            }
+            break;
+        }
+        if (function_exists('usleep')) {
+            usleep(10000);
+        }
+    }
+    $chunk = @stream_get_contents($pipes[1]);
+    if ($chunk !== false && $chunk !== '') {
+        $stdout .= $chunk;
+    }
+    $chunk = @stream_get_contents($pipes[2]);
+    if ($chunk !== false && $chunk !== '') {
+        $stderr .= $chunk;
+    }
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $closeCode = @proc_close($proc);
+    if ($exitCode === null || $exitCode === -1) {
+        $exitCode = $closeCode;
+    }
+    $code   = (int) $exitCode;
+    $output = db_sync_exec_output_lines($stdout . $stderr);
+}
+
+/* system()/passthru() z buforem wyjscia - zwracaja kod wyjscia. */
+function db_sync_exec_system($cmd, &$output, &$code)
+{
+    $code = -1;
+    ob_start();
+    if (function_exists('system')) {
+        @system($cmd, $code);
+    } elseif (function_exists('passthru')) {
+        @passthru($cmd, $code);
+    }
+    $text = ob_get_clean();
+    $output = db_sync_exec_output_lines($text);
+}
+
+/* shell_exec nie zwraca kodu wyjscia - kod zapisuje powloka do pliku
+   statusu (ten sam mechanizm co przy archiwach, odporny na ubicie PHP). */
+function db_sync_exec_shell($cmd, &$output, &$code)
+{
+    $statusFile = false;
+    if (function_exists('tempnam')) {
+        $statusFile = @tempnam(function_exists('sys_get_temp_dir') ? sys_get_temp_dir() : '.', 'dbsync');
+    }
+    if ($statusFile === false) {
+        if (function_exists('popen')) {
+            db_sync_exec_popen($cmd, $output, $code);
+            return;
+        }
+        $text = @shell_exec($cmd);
+        $code = -1;
+        $output = db_sync_exec_output_lines($text);
+        return;
+    }
+    @unlink($statusFile);
+    $text = @shell_exec($cmd . db_sync_archive_status_suffix($statusFile));
+    $status = db_sync_archive_status_code($statusFile);
+    @unlink($statusFile);
+    $code   = ($status === null) ? -1 : (int) $status;
+    $output = db_sync_exec_output_lines($text);
+}
+
+function db_sync_exec_popen($cmd, &$output, &$code)
+{
+    $h = @popen($cmd, 'r');
+    if (!is_resource($h)) {
+        throw new Exception('Nie moge uruchomic procesu (popen).');
+    }
+    $text = stream_get_contents($h);
+    $status = (int) @pclose($h);
+    if (PHP_OS_FAMILY !== 'Windows' && $status > 255) {
+        // POSIX: pclose() zwraca status wait(), a nie sam kod wyjscia
+        $status = ($status >> 8) & 0xFF;
+    }
+    $code = $status;
+    $output = db_sync_exec_output_lines($text);
+}
+
+/* Uruchamia komende i wypelnia $output (linie) oraz $code (kod wyjscia).
+   Gdy exec() jest wylaczony, probuje kolejno proc_open/system/passthru/
+   shell_exec/popen. Gdy zaden nie jest dostepny, rzuca wyjatek - ale akcje
+   bazy/archiwum w takiej sytuacji w ogole nie wywoluja CLI (patrz nizej). */
 function db_sync_exec($cmd, &$output, &$code)
 {
     $output = array();
     $code   = -1;
-    if (!function_exists('exec')) {
-        throw new Exception('Funkcja exec() jest wylaczona na serwerze - nie moge uruchomic narzedzi CLI (mysql/mysqldump).');
+    $runner = db_sync_process_runner();
+    if ($runner === 'exec') {
+        exec($cmd, $output, $code);
+        return;
     }
-    exec($cmd, $output, $code);
+    if ($runner === 'proc_open') {
+        db_sync_exec_proc_open($cmd, $output, $code);
+        return;
+    }
+    if ($runner === 'system' || $runner === 'passthru') {
+        db_sync_exec_system($cmd, $output, $code);
+        return;
+    }
+    if ($runner === 'shell_exec') {
+        db_sync_exec_shell($cmd, $output, $code);
+        return;
+    }
+    if ($runner === 'popen') {
+        db_sync_exec_popen($cmd, $output, $code);
+        return;
+    }
+    throw new Exception('Funkcja exec() jest wylaczona na serwerze i brak dzialajacego zamiennika (proc_open/system/passthru/shell_exec/popen) - nie moge uruchomic narzedzi CLI (mysql/mysqldump). Uzywam trybu PHP (wbudowanego) tam, gdzie jest dostepny.');
 }
 
 function db_sync_parse_wp_config($path)
@@ -368,14 +573,1009 @@ function db_sync_creds_summary($creds)
     return implode(' | ', $parts);
 }
 
+/* ------------------------------------------------------------------ */
+/* Warstwa PHP do bazy (fallback bez mysql/mysqldump)                  */
+/* ------------------------------------------------------------------ */
+
+function db_sync_native_open($creds, $host, $port)
+{
+    $err = '';
+    $mysqliOk = function_exists('mysqli_connect')
+        && function_exists('mysqli_query')
+        && function_exists('mysqli_fetch_row')
+        && function_exists('mysqli_fetch_assoc')
+        && function_exists('mysqli_real_escape_string')
+        && function_exists('mysqli_error');
+    if ($mysqliOk) {
+        if (function_exists('mysqli_report') && defined('MYSQLI_REPORT_OFF')) {
+            @mysqli_report(MYSQLI_REPORT_OFF);
+        }
+        $link = false;
+        try {
+            if (strpos($host, '/') === 0) {
+                $link = @mysqli_connect('localhost', $creds['DB_USER'], $creds['DB_PASSWORD'], $creds['DB_NAME'], 0, $host);
+            } else {
+                $link = @mysqli_connect($host, $creds['DB_USER'], $creds['DB_PASSWORD'], $creds['DB_NAME'], ($port === '' ? 0 : (int) $port));
+            }
+        } catch (Exception $e) {
+            $err = $e->getMessage();
+            $link = false;
+        }
+        if ($link) {
+            if (function_exists('mysqli_set_charset')) {
+                if (!@mysqli_set_charset($link, 'utf8')) {
+                    @mysqli_set_charset($link, 'utf8mb4');
+                }
+            }
+            return array('type' => 'mysqli', 'link' => $link);
+        }
+        $err = function_exists('mysqli_connect_error') ? mysqli_connect_error() : 'blad polaczenia mysqli';
+    }
+    if (class_exists('PDO')) {
+        $dsn = '';
+        if (strpos($host, '/') === 0) {
+            $dsn = 'mysql:unix_socket=' . $host . ';dbname=' . $creds['DB_NAME'] . ';charset=utf8';
+        } else {
+            $dsn = 'mysql:host=' . $host . ';dbname=' . $creds['DB_NAME'] . ';charset=utf8';
+            if ($port !== '') {
+                $dsn .= ';port=' . $port;
+            }
+        }
+        try {
+            $pdo = new PDO($dsn, $creds['DB_USER'], $creds['DB_PASSWORD'], array(
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_EMULATE_PREPARES => true,
+            ));
+            return array('type' => 'pdo', 'link' => $pdo);
+        } catch (Exception $e) {
+            $err .= ($err !== '' ? '; ' : '') . 'PDO: ' . $e->getMessage();
+        }
+    }
+    throw new Exception('Brak dzialajacego rozszerzenia PHP do MySQL (mysqli/PDO MySQL) - nie moge wykonac operacji bez CLI.'
+        . ($err !== '' ? ' Szczegoly: ' . $err : ''));
+}
+
+function db_sync_native_close($conn)
+{
+    if (!is_array($conn) || !isset($conn['type'])) {
+        return;
+    }
+    if ($conn['type'] === 'mysqli') {
+        if (function_exists('mysqli_close')) {
+            @mysqli_close($conn['link']);
+        }
+    }
+}
+
+function db_sync_native_query($conn, $sql)
+{
+    if ($conn['type'] === 'mysqli') {
+        $res = @mysqli_query($conn['link'], $sql);
+        if ($res === false) {
+            throw new Exception('MySQL: ' . mysqli_error($conn['link']));
+        }
+        return $res;
+    }
+    try {
+        $res = $conn['link']->query($sql);
+        if ($res === false) {
+            $info = $conn['link']->errorInfo();
+            throw new Exception('MySQL: ' . (isset($info[2]) ? $info[2] : 'blad zapytania'));
+        }
+        return $res;
+    } catch (Exception $e) {
+        throw new Exception($e->getMessage());
+    }
+}
+
+function db_sync_native_try($conn, $sql)
+{
+    try {
+        $res = db_sync_native_query($conn, $sql);
+        db_sync_native_free($conn, $res);
+        return true;
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+function db_sync_native_free($conn, $res)
+{
+    if (!is_array($conn) || !isset($conn['type'])) {
+        return;
+    }
+    if ($conn['type'] === 'mysqli') {
+        if (is_object($res) && $res !== true && function_exists('mysqli_free_result')) {
+            @mysqli_free_result($res);
+        }
+        return;
+    }
+    if (is_object($res) && method_exists($res, 'closeCursor')) {
+        try {
+            @$res->closeCursor();
+        } catch (Exception $e) {
+            // ignorujemy blad zamykania kursora
+        }
+    }
+    if (defined('PDO::MYSQL_ATTR_USE_BUFFERED_QUERY')) {
+        try {
+            @$conn['link']->setAttribute(PDO::MYSQL_ATTR_USE_BUFFERED_QUERY, true);
+        } catch (Exception $e) {
+            // sterownik nie obsluguje tej opcji - ignorujemy
+        }
+    }
+}
+
+function db_sync_native_fetch_row($conn, $res)
+{
+    if ($conn['type'] === 'mysqli') {
+        $row = @mysqli_fetch_row($res);
+        return ($row === false) ? null : $row;
+    }
+    $row = $res->fetch(PDO::FETCH_NUM);
+    return ($row === false) ? null : $row;
+}
+
+function db_sync_native_fetch_assoc($conn, $res)
+{
+    if ($conn['type'] === 'mysqli') {
+        $row = @mysqli_fetch_assoc($res);
+        return ($row === false) ? null : $row;
+    }
+    $row = $res->fetch(PDO::FETCH_ASSOC);
+    return ($row === false) ? null : $row;
+}
+
+function db_sync_native_fetch_all($conn, $sql)
+{
+    $res  = db_sync_native_query($conn, $sql);
+    $rows = array();
+    while (($row = db_sync_native_fetch_assoc($conn, $res)) !== null) {
+        $rows[] = $row;
+    }
+    db_sync_native_free($conn, $res);
+    return $rows;
+}
+
+function db_sync_native_quote($conn, $value)
+{
+    if ($conn['type'] === 'mysqli') {
+        return "'" . mysqli_real_escape_string($conn['link'], (string) $value) . "'";
+    }
+    $quoted = $conn['link']->quote((string) $value);
+    return ($quoted === false) ? "''" : $quoted;
+}
+
+function db_sync_native_escape($conn, $value)
+{
+    if ($conn['type'] === 'mysqli') {
+        return mysqli_real_escape_string($conn['link'], (string) $value);
+    }
+    $quoted = $conn['link']->quote((string) $value);
+    return ($quoted === false) ? '' : substr($quoted, 1, -1);
+}
+
+function db_sync_native_row_get($row, $key, $default = '')
+{
+    if (isset($row[$key])) {
+        return $row[$key];
+    }
+    foreach ($row as $k => $v) {
+        if (strcasecmp($k, $key) === 0) {
+            return $v;
+        }
+    }
+    return $default;
+}
+
+function db_sync_native_test_connection($creds, $host, $port)
+{
+    try {
+        $conn = db_sync_native_open($creds, $host, $port);
+        $res  = db_sync_native_query($conn, 'SELECT 1');
+        db_sync_native_free($conn, $res);
+        db_sync_native_close($conn);
+        return true;
+    } catch (Exception $e) {
+        return 'BLAD: ' . $e->getMessage();
+    }
+}
+
+function db_sync_native_tables_meta($conn, $dbName)
+{
+    $sql = "SELECT table_name AS name, IFNULL(data_length + index_length, 0) AS size, table_type AS type "
+        . "FROM information_schema.tables WHERE table_schema = " . db_sync_native_quote($conn, $dbName)
+        . " ORDER BY table_name";
+    $rows = db_sync_native_fetch_all($conn, $sql);
+    $out  = array();
+    foreach ($rows as $row) {
+        $name = '';
+        if (isset($row['name'])) {
+            $name = $row['name'];
+        } elseif (isset($row['TABLE_NAME'])) {
+            $name = $row['TABLE_NAME'];
+        }
+        if ($name === '') {
+            continue;
+        }
+        $out[$name] = array(
+            'size' => isset($row['size']) ? $row['size'] : 0,
+            'type' => isset($row['type']) ? $row['type'] : '',
+        );
+    }
+    return $out;
+}
+
+function db_sync_native_list_tables($creds, $host, $port)
+{
+    $conn = db_sync_native_open($creds, $host, $port);
+    $meta = db_sync_native_tables_meta($conn, $creds['DB_NAME']);
+    db_sync_native_close($conn);
+    $tables = array();
+    foreach ($meta as $name => $m) {
+        $tables[$name] = (float) $m['size'];
+    }
+    return $tables;
+}
+
+function db_sync_native_identifier($name)
+{
+    return '`' . str_replace('`', '``', $name) . '`';
+}
+
+function db_sync_native_columns($conn, $dbName, $table)
+{
+    $sql = "SELECT COLUMN_NAME, DATA_TYPE, EXTRA FROM information_schema.columns "
+        . "WHERE TABLE_SCHEMA = " . db_sync_native_quote($conn, $dbName)
+        . " AND TABLE_NAME = " . db_sync_native_quote($conn, $table)
+        . " ORDER BY ORDINAL_POSITION";
+    $rows = db_sync_native_fetch_all($conn, $sql);
+    $out  = array();
+    foreach ($rows as $row) {
+        $extra = isset($row['EXTRA']) ? strtoupper($row['EXTRA']) : '';
+        // Pomijamy tylko kolumny generowane (VIRTUAL/STORED/PERSISTENT).
+        // "DEFAULT_GENERATED" to zwykla kolumna z domyslna wyrazeniem -
+        // jej wartosci musza trafic do INSERT.
+        if (strpos($extra, 'VIRTUAL GENERATED') !== false
+            || strpos($extra, 'STORED GENERATED') !== false
+            || strpos($extra, 'PERSISTENT GENERATED') !== false) {
+            continue;
+        }
+        $colName  = isset($row['COLUMN_NAME']) ? $row['COLUMN_NAME'] : '';
+        $dataType = isset($row['DATA_TYPE']) ? $row['DATA_TYPE'] : '';
+        if ($colName === '' || $dataType === '') {
+            continue;
+        }
+        $out[] = array(
+            'name' => $colName,
+            'type' => strtolower($dataType),
+        );
+    }
+    return $out;
+}
+
+function db_sync_native_value($conn, $value, $type)
+{
+    if ($value === null) {
+        return 'NULL';
+    }
+    $binary = array(
+        'binary', 'varbinary', 'tinyblob', 'blob', 'mediumblob', 'longblob',
+        'geometry', 'point', 'linestring', 'polygon', 'multipoint',
+        'multilinestring', 'multipolygon', 'geometrycollection',
+    );
+    if (in_array($type, $binary)) {
+        // pusty BLOB/BINARY: literal 0x jest niepoprawny (MySQL czyta go
+        // jako nazwe kolumny), dlatego pusty string w cudzyslowie
+        return ($value === '') ? "''" : '0x' . bin2hex((string) $value);
+    }
+    if ($type === 'bit') {
+        // MySQL 5.7 zwraca BIT jako lancuch dziesietny; dla pewnosci
+        // obslugujemy tez binarna reprezentacje
+        if ($value === '') {
+            return '0';
+        }
+        return preg_match('/^\d+$/', (string) $value) ? (string) $value : '0x' . bin2hex((string) $value);
+    }
+    $numeric = array(
+        'tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint',
+        'decimal', 'numeric', 'float', 'double', 'real', 'year',
+    );
+    if (in_array($type, $numeric) && preg_match('/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/', (string) $value)) {
+        return (string) $value;
+    }
+    return db_sync_native_quote($conn, $value);
+}
+
+function db_sync_write_all($fh, $data)
+{
+    $len  = strlen($data);
+    $done = 0;
+    while ($done < $len) {
+        $n = @fwrite($fh, substr($data, $done));
+        if ($n === false || $n === 0) {
+            return false;
+        }
+        $done += $n;
+    }
+    return true;
+}
+
+function db_sync_native_dump_header($fh, $dbName, $tzUtc)
+{
+    $head = "-- _dbsync native PHP dump (fallback bez mysqldump)\n"
+        . "-- Baza: " . $dbName . "\n"
+        . "-- Data: " . date('Y-m-d H:i:s') . "\n"
+        . "--\n\n"
+        . "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n"
+        . "/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;\n"
+        . "/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;\n"
+        . "/*!40101 SET NAMES utf8 */;\n"
+        . "/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;\n"
+        . "/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;\n"
+        . "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n";
+    if ($tzUtc) {
+        $head .= "/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;\n"
+            . "/*!40103 SET TIME_ZONE='+00:00' */;\n";
+    }
+    $head .= "\n";
+    return db_sync_write_all($fh, $head);
+}
+
+function db_sync_native_dump_footer($fh, $tzUtc)
+{
+    $foot = "\n"
+        . "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n"
+        . "/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;\n"
+        . "/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;\n"
+        . "/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;\n"
+        . "/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;\n"
+        . "/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;\n";
+    if ($tzUtc) {
+        $foot .= "/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;\n";
+    }
+    return db_sync_write_all($fh, $foot . "\n-- Koniec dumpu\n");
+}
+
+function db_sync_native_dump_insert($fh, $qTable, $colNames, $batch)
+{
+    return db_sync_write_all($fh, 'INSERT INTO ' . $qTable . ' (' . implode(', ', $colNames) . ') VALUES '
+        . implode(',', $batch) . ";\n");
+}
+
+function db_sync_native_query_unbuffered($conn, $sql)
+{
+    if ($conn['type'] === 'mysqli') {
+        $flags = defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 0;
+        $res = @mysqli_query($conn['link'], $sql, $flags);
+        if ($res === false) {
+            throw new Exception('MySQL: ' . mysqli_error($conn['link']));
+        }
+        return $res;
+    }
+    if (defined('PDO::MYSQL_ATTR_USE_BUFFERED_QUERY')) {
+        try {
+            @$conn['link']->setAttribute(PDO::MYSQL_ATTR_USE_BUFFERED_QUERY, false);
+        } catch (Exception $e) {
+            // sterownik nie obsluguje tej opcji - zapytanie bedzie buforowane
+        }
+    }
+    try {
+        $res = $conn['link']->query($sql);
+        if ($res === false) {
+            $info = $conn['link']->errorInfo();
+            throw new Exception('MySQL: ' . (isset($info[2]) ? $info[2] : 'blad zapytania'));
+        }
+        return $res;
+    } catch (Exception $e) {
+        throw new Exception($e->getMessage());
+    }
+}
+
+/* Odpowiednik mysqldump --no-tablespaces: usuwa klauzule TABLESPACE z
+   opcji tabeli (tylko po ostatnim nawiasie, zeby nie ruszyc komentarzy
+   kolumn wewnatrz definicji). */
+function db_sync_native_strip_tablespace($create)
+{
+    // Klauzula TABLESPACE w SHOW CREATE TABLE wystepuje na koncu opcji
+    // tabeli (opcjonalnie przed PARTITION BY); lookahead chroni przed
+    // przypadkowym dopasowaniem tekstu w komentarzu kolumny.
+    $out = preg_replace(
+        '/\s+TABLESPACE\s*=?\s*(?:`[^`]*`|[A-Za-z0-9_$]+)(?=\s*(?:PARTITION\b|$))/i',
+        '',
+        $create
+    );
+    return ($out === null) ? $create : $out;
+}
+
+function db_sync_native_dump_table($conn, $fh, $dbName, $table, $idx, $total)
+{
+    $qTable = db_sync_native_identifier($table);
+    $rows   = db_sync_native_fetch_all($conn, 'SHOW CREATE TABLE ' . $qTable);
+    if (empty($rows)) {
+        throw new Exception('Nie moge odczytac struktury tabeli ' . $table);
+    }
+    $create = '';
+    foreach ($rows[0] as $key => $value) {
+        if (stripos($key, 'create') !== false) {
+            $create = $value;
+            break;
+        }
+    }
+    if ($create === '' && isset($rows[0][1])) {
+        $create = $rows[0][1];
+    }
+    if ($create === '') {
+        throw new Exception('SHOW CREATE TABLE nie zwrocilo definicji tabeli ' . $table);
+    }
+    $create = db_sync_native_strip_tablespace($create);
+
+    if (!db_sync_write_all($fh, "\n--\n-- Table structure for table " . $qTable . "\n--\n\n")) {
+        throw new Exception('Nie moge zapisac dumpu (struktura ' . $table . ').');
+    }
+    if (!db_sync_write_all($fh, 'DROP TABLE IF EXISTS ' . $qTable . ";\n" . $create . ";\n")) {
+        throw new Exception('Nie moge zapisac dumpu (struktura ' . $table . ').');
+    }
+
+    $columns = db_sync_native_columns($conn, $dbName, $table);
+    if (empty($columns)) {
+        db_sync_log('DUMP', $idx . '/' . $total . ' ' . $table . ' (0 kolumn - pominiety)');
+        return;
+    }
+    $colNames = array();
+    foreach ($columns as $column) {
+        $colNames[] = db_sync_native_identifier($column['name']);
+    }
+    $select = 'SELECT ' . implode(', ', $colNames) . ' FROM ' . $qTable;
+
+    if (!db_sync_write_all($fh, "\n--\n-- Dumping data for table " . $qTable . "\n--\n\n"
+        . '/*!40000 ALTER TABLE ' . $qTable . " DISABLE KEYS */;\n")) {
+        throw new Exception('Nie moge zapisac dumpu (dane ' . $table . ').');
+    }
+
+    $res        = db_sync_native_query_unbuffered($conn, $select);
+    $batch      = array();
+    $batchBytes = 0;
+    $rowCount   = 0;
+    while (($row = db_sync_native_fetch_row($conn, $res)) !== null) {
+        $values = array();
+        foreach ($columns as $i => $column) {
+            $values[] = db_sync_native_value($conn, isset($row[$i]) ? $row[$i] : null, $column['type']);
+        }
+        $tuple       = '(' . implode(',', $values) . ')';
+        $batch[]     = $tuple;
+        $batchBytes += strlen($tuple);
+        $rowCount++;
+        if (count($batch) >= 500 || $batchBytes >= 1048576) {
+            if (!db_sync_native_dump_insert($fh, $qTable, $colNames, $batch)) {
+                db_sync_native_free($conn, $res);
+                throw new Exception('Nie moge zapisac dumpu (dane ' . $table . ').');
+            }
+            $batch      = array();
+            $batchBytes = 0;
+        }
+    }
+    if (!empty($batch)) {
+        if (!db_sync_native_dump_insert($fh, $qTable, $colNames, $batch)) {
+            db_sync_native_free($conn, $res);
+            throw new Exception('Nie moge zapisac dumpu (dane ' . $table . ').');
+        }
+    }
+    db_sync_native_free($conn, $res);
+
+    if (!db_sync_write_all($fh, '/*!40000 ALTER TABLE ' . $qTable . " ENABLE KEYS */;\n")) {
+        throw new Exception('Nie moge zapisac dumpu (dane ' . $table . ').');
+    }
+    db_sync_log('DUMP', $idx . '/' . $total . ' ' . $table . ' (' . $rowCount . ' rekordow)');
+}
+
+/* Placeholder widokow (jak w mysqldump): najpierw wszystkie widoki powstaja
+   jako SELECT 1 AS kolumna, dzieki czemu widoki zalezne od siebie moga byc
+   tworzone w dowolnej kolejnosci, a potem sa podmieniane na wlasciwe. */
+function db_sync_native_dump_view_placeholders($conn, $fh, $dbName, $views)
+{
+    if (empty($views)) {
+        return;
+    }
+    if (!db_sync_write_all($fh, "\n--\n-- Temporary view structures (dependent views)\n--\n\n")) {
+        throw new Exception('Nie moge zapisac zastepczych struktur widokow.');
+    }
+    foreach ($views as $view) {
+        $qView   = db_sync_native_identifier($view);
+        $columns = db_sync_native_columns($conn, $dbName, $view);
+        if (empty($columns)) {
+            $rows = db_sync_native_fetch_all($conn, 'SHOW COLUMNS FROM ' . $qView);
+            foreach ($rows as $row) {
+                $name = db_sync_native_row_get($row, 'Field', '');
+                if ($name !== '') {
+                    $columns[] = array('name' => $name, 'type' => '');
+                }
+            }
+        }
+        $select = array();
+        foreach ($columns as $column) {
+            if ($column['name'] !== '') {
+                $select[] = '1 AS ' . db_sync_native_identifier($column['name']);
+            }
+        }
+        if (empty($select)) {
+            continue;
+        }
+        $sql = 'DROP TABLE IF EXISTS ' . $qView . ";\n"
+            . 'DROP VIEW IF EXISTS ' . $qView . ";\n"
+            . 'CREATE VIEW ' . $qView . ' AS SELECT ' . implode(', ', $select) . ";\n";
+        if (!db_sync_write_all($fh, $sql)) {
+            throw new Exception('Nie moge zapisac zastepczego widoku ' . $view . '.');
+        }
+    }
+}
+
+function db_sync_native_dump_view($conn, $fh, $dbName, $view, $idx, $total)
+{
+    $qView = db_sync_native_identifier($view);
+    $rows  = db_sync_native_fetch_all($conn, 'SHOW CREATE VIEW ' . $qView);
+    if (empty($rows)) {
+        throw new Exception('Nie moge odczytac definicji widoku ' . $view);
+    }
+    $create = '';
+    foreach ($rows[0] as $key => $value) {
+        if (stripos($key, 'create') !== false) {
+            $create = $value;
+            break;
+        }
+    }
+    if ($create === '' && isset($rows[0][1])) {
+        $create = $rows[0][1];
+    }
+    if ($create === '') {
+        throw new Exception('SHOW CREATE VIEW nie zwrocilo definicji widoku ' . $view);
+    }
+    $charset = db_sync_native_row_get($rows[0], 'character_set_client', 'utf8');
+    $collation = db_sync_native_row_get($rows[0], 'collation_connection', 'utf8_general_ci');
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $charset)) {
+        $charset = 'utf8';
+    }
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $collation)) {
+        $collation = 'utf8_general_ci';
+    }
+    $set = "SET @dbsync_saved_cs_client = @@character_set_client;\n"
+        . "SET @dbsync_saved_cs_results = @@character_set_results;\n"
+        . "SET @dbsync_saved_col_connection = @@collation_connection;\n"
+        . "SET character_set_client = " . $charset . ";\n"
+        . "SET character_set_results = " . $charset . ";\n"
+        . "SET collation_connection = " . $collation . ";\n";
+    $restore = "SET character_set_client = @dbsync_saved_cs_client;\n"
+        . "SET character_set_results = @dbsync_saved_cs_results;\n"
+        . "SET collation_connection = @dbsync_saved_col_connection;\n";
+    if (!db_sync_write_all($fh, "\n--\n-- View " . $qView . "\n--\n\n"
+        . $set
+        . 'DROP TABLE IF EXISTS ' . $qView . ";\n"
+        . 'DROP VIEW IF EXISTS ' . $qView . ";\n"
+        . $create . ";\n" . $restore)) {
+        throw new Exception('Nie moge zapisac dumpu (widok ' . $view . ').');
+    }
+    db_sync_log('DUMP', $idx . '/' . $total . ' widok ' . $view);
+}
+
+function db_sync_native_dump_triggers($conn, $fh, $dbName, $exclude)
+{
+    try {
+        $rows = db_sync_native_fetch_all($conn, 'SHOW TRIGGERS');
+    } catch (Exception $e) {
+        db_sync_log('OSTRZEZENIE', 'nie moge odczytac listy triggerow: ' . $e->getMessage(), true);
+        return;
+    }
+    foreach ($rows as $row) {
+        $name  = db_sync_native_row_get($row, 'Trigger', '');
+        $table = db_sync_native_row_get($row, 'Table', '');
+        if ($name === '' || in_array($table, $exclude, true)) {
+            continue;
+        }
+        try {
+            $qName = db_sync_native_identifier($name);
+            $defs  = db_sync_native_fetch_all($conn, 'SHOW CREATE TRIGGER ' . $qName);
+            if (empty($defs)) {
+                continue;
+            }
+            $create = '';
+            foreach ($defs[0] as $key => $value) {
+                if (stripos($key, 'SQL Original Statement') !== false) {
+                    $create = $value;
+                    break;
+                }
+            }
+            if ($create === '' && isset($defs[0][2])) {
+                $create = $defs[0][2];
+            }
+            if ($create === '') {
+                continue;
+            }
+            $create = rtrim($create);
+            if (substr($create, -1) === ';') {
+                $create = rtrim(substr($create, 0, -1));
+            }
+            $sqlMode   = db_sync_native_row_get($defs[0], 'sql_mode', '');
+            $charset   = db_sync_native_row_get($defs[0], 'character_set_client', 'utf8');
+            $collation = db_sync_native_row_get($defs[0], 'collation_connection', 'utf8_general_ci');
+            if (!preg_match('/^[A-Za-z0-9_]+$/', $charset)) {
+                $charset = 'utf8';
+            }
+            if (!preg_match('/^[A-Za-z0-9_]+$/', $collation)) {
+                $collation = 'utf8_general_ci';
+            }
+            $set = "SET @dbsync_saved_cs_client = @@character_set_client;\n"
+                . "SET @dbsync_saved_cs_results = @@character_set_results;\n"
+                . "SET @dbsync_saved_col_connection = @@collation_connection;\n"
+                . "SET @dbsync_saved_sql_mode = @@sql_mode;\n"
+                . "SET character_set_client = " . $charset . ";\n"
+                . "SET character_set_results = " . $charset . ";\n"
+                . "SET collation_connection = " . $collation . ";\n";
+            if ($sqlMode !== '') {
+                $set .= "SET sql_mode = " . db_sync_native_quote($conn, $sqlMode) . ";\n";
+            }
+            $restore = "SET sql_mode = @dbsync_saved_sql_mode;\n"
+                . "SET character_set_client = @dbsync_saved_cs_client;\n"
+                . "SET character_set_results = @dbsync_saved_cs_results;\n"
+                . "SET collation_connection = @dbsync_saved_col_connection;\n";
+            // DELIMITER obsluguje zarowno mysql CLI, jak i parser PHP.
+            if (!db_sync_write_all($fh, "\n--\n-- Trigger " . $qName . "\n--\n\n"
+                . $set
+                . 'DROP TRIGGER IF EXISTS ' . $qName . ";\n"
+                . "DELIMITER ;;\n" . $create . ";;\nDELIMITER ;\n"
+                . $restore)) {
+                throw new Exception('Nie moge zapisac triggera ' . $name);
+            }
+        } catch (Exception $e) {
+            db_sync_log('OSTRZEZENIE', 'pomijam trigger ' . $name . ': ' . $e->getMessage(), true);
+        }
+    }
+}
+
+function db_sync_native_dump($creds, $host, $port, $exclude, $sqlFile)
+{
+    if (!function_exists('fopen') || !function_exists('fwrite') || !function_exists('fclose') || !function_exists('fflush')) {
+        throw new Exception('Dump PHP wymaga funkcji fopen/fwrite/fclose/fflush, ktore sa wylaczone na serwerze.');
+    }
+    $conn = db_sync_native_open($creds, $host, $port);
+    $part = $sqlFile . '.part';
+    $fh   = @fopen($part, 'wb');
+    if ($fh === false) {
+        db_sync_native_close($conn);
+        throw new Exception('Nie moge utworzyc pliku dumpu: ' . $part);
+    }
+
+    $snapshot = false;
+    try {
+        @db_sync_native_try($conn, "SET NAMES utf8");
+        @db_sync_native_try($conn, "SET SESSION sql_mode='NO_AUTO_VALUE_ON_ZERO'");
+        $tzUtc = db_sync_native_try($conn, "SET SESSION time_zone='+00:00'");
+        // Odpowiednik --single-transaction dla InnoDB (spojny snapshot).
+        $snapshot = db_sync_native_try($conn, 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        $snapshot = $snapshot && db_sync_native_try($conn, 'START TRANSACTION WITH CONSISTENT SNAPSHOT');
+
+        $meta  = db_sync_native_tables_meta($conn, $creds['DB_NAME']);
+        $base  = array();
+        $views = array();
+        foreach ($meta as $name => $m) {
+            if (in_array($name, $exclude, true)) {
+                continue;
+            }
+            if (strtoupper($m['type']) === 'VIEW') {
+                $views[] = $name;
+            } else {
+                $base[] = $name;
+            }
+        }
+        db_sync_log('TRYB DUMPU', 'PHP (wbudowany) - mysqli/PDO, bez mysqldump');
+        db_sync_log('TABELE', count($base) . ' tabel, ' . count($views) . ' widokow');
+
+        if (!db_sync_native_dump_header($fh, $creds['DB_NAME'], $tzUtc)) {
+            throw new Exception('Nie moge zapisac naglowka dumpu.');
+        }
+        $total = count($base);
+        foreach ($base as $i => $table) {
+            db_sync_native_dump_table($conn, $fh, $creds['DB_NAME'], $table, $i + 1, $total);
+        }
+        db_sync_native_dump_view_placeholders($conn, $fh, $creds['DB_NAME'], $views);
+        $totalViews = count($views);
+        foreach ($views as $i => $view) {
+            db_sync_native_dump_view($conn, $fh, $creds['DB_NAME'], $view, $i + 1, $totalViews);
+        }
+        db_sync_native_dump_triggers($conn, $fh, $creds['DB_NAME'], $exclude);
+        if (!db_sync_native_dump_footer($fh, $tzUtc)) {
+            throw new Exception('Nie moge zapisac stopki dumpu.');
+        }
+        if ($snapshot) {
+            db_sync_native_try($conn, 'COMMIT');
+        }
+        fflush($fh);
+        if (!fclose($fh)) {
+            $fh = false;
+            throw new Exception('Nie moge zakonczyc zapisu pliku dumpu (dysk pelny?).');
+        }
+        $fh = false;
+
+        if (is_file($sqlFile) && !@unlink($sqlFile)) {
+            throw new Exception('Nie moge nadpisac istniejacego pliku: ' . $sqlFile);
+        }
+        if (!@rename($part, $sqlFile)) {
+            throw new Exception('Nie moge zmienic nazwy pliku dumpu: ' . basename($part));
+        }
+    } catch (Exception $e) {
+        if (is_resource($fh)) {
+            fclose($fh);
+        }
+        if ($snapshot) {
+            db_sync_native_try($conn, 'ROLLBACK');
+        }
+        @unlink($part);
+        db_sync_native_close($conn);
+        throw $e;
+    }
+    db_sync_native_close($conn);
+    return $sqlFile;
+}
+
+/* Parser pliku SQL: strumieniowo dzieli go na instrukcje, uwzgledniajac
+   cudzyslowy, backticki, komentarze, komentarze warunkowe (wykrzyknik
+   po nawiasie) oraz DELIMITER (triggery). Kazda instrukcje przekazuje
+   do $callback. */
+function db_sync_sql_parse_file($sqlFile, $callback, $mariaDb = true)
+{
+    if (!function_exists('fopen') || !function_exists('fgets') || !function_exists('fclose')) {
+        throw new Exception('Import PHP wymaga funkcji fopen/fgets/fclose, ktore sa wylaczone na serwerze.');
+    }
+    $fh = @fopen($sqlFile, 'rb');
+    if ($fh === false) {
+        throw new Exception('Nie moge odczytac pliku SQL: ' . $sqlFile);
+    }
+    $delimiter   = ';';
+    $statement   = '';
+    $inString    = false;
+    $inBacktick  = false;
+    $inBlock     = false;
+    $inCondition = false;
+    $inLine      = false;
+    $escape      = false;
+    $quote       = '';
+    $lineNo      = 0;
+    $firstLine   = true;
+
+    try {
+    while (($line = fgets($fh)) !== false) {
+        $lineNo++;
+        if ($firstLine) {
+            if (substr($line, 0, 3) === "\xEF\xBB\xBF") {
+                $line = substr($line, 3);
+            }
+            $firstLine = false;
+        }
+        if (!$inString && !$inBacktick && !$inBlock && !$inCondition && !$inLine
+            && trim($statement) === ''
+            && preg_match('/^\s*DELIMITER\s+(\S+)\s*$/i', $line, $m)) {
+            $delimiter = $m[1];
+            $statement = '';
+            continue;
+        }
+        $len = strlen($line);
+        for ($i = 0; $i < $len; $i++) {
+            $ch    = $line[$i];
+            $next  = ($i + 1 < $len) ? $line[$i + 1] : '';
+            $next2 = ($i + 2 < $len) ? $line[$i + 2] : '';
+
+            if ($inLine) {
+                if ($ch === "\n") {
+                    $inLine = false;
+                }
+                continue;
+            }
+            if ($inBlock) {
+                if ($ch === '*' && $next === '/') {
+                    $inBlock = false;
+                    $i++;
+                }
+                continue;
+            }
+            if ($inString) {
+                $statement .= $ch;
+                if ($escape) {
+                    $escape = false;
+                } elseif ($ch === '\\') {
+                    $escape = true;
+                } elseif ($ch === $quote) {
+                    $inString = false;
+                }
+                continue;
+            }
+            if ($inBacktick) {
+                $statement .= $ch;
+                if ($ch === '`') {
+                    $inBacktick = false;
+                }
+                continue;
+            }
+            if ($inCondition) {
+                // wewnatrz komentarza warunkowego obowiazuje normalna skladnia
+                // (cudzyslowy/komentarze), ale srednik nie konczy instrukcji
+                // przed zamknieciem "*/"
+                if ($ch === '*' && $next === '/') {
+                    $inCondition = false;
+                    $i++;
+                    continue;
+                }
+                if ($ch === "'" || $ch === '"') {
+                    $inString = true;
+                    $quote    = $ch;
+                    $statement .= $ch;
+                    continue;
+                }
+                if ($ch === '`') {
+                    $inBacktick = true;
+                    $statement .= $ch;
+                    continue;
+                }
+                if ($ch === '#') {
+                    $statement .= ' ';
+                    $inLine = true;
+                    continue;
+                }
+                if ($ch === '-' && $next === '-'
+                    && ($next2 === '' || $next2 === ' ' || $next2 === "\t" || $next2 === "\r" || $next2 === "\n")) {
+                    $statement .= ' ';
+                    $inLine = true;
+                    $i++;
+                    continue;
+                }
+                if ($ch === '/' && $next === '*') {
+                    $statement .= ' ';
+                    $inBlock = true;
+                    $i++;
+                    continue;
+                }
+                $statement .= $ch;
+                continue;
+            }
+            if ($ch === "'" || $ch === '"') {
+                $inString = true;
+                $quote    = $ch;
+                $statement .= $ch;
+                continue;
+            }
+            if ($ch === '`') {
+                $inBacktick = true;
+                $statement .= $ch;
+                continue;
+            }
+            if ($ch === '#') {
+                $statement .= ' ';
+                $inLine = true;
+                continue;
+            }
+            if ($ch === '-' && $next === '-'
+                && ($next2 === '' || $next2 === ' ' || $next2 === "\t" || $next2 === "\r" || $next2 === "\n")) {
+                $statement .= ' ';
+                $inLine = true;
+                $i++;
+                continue;
+            }
+            if ($ch === '/' && $next === '*') {
+                if ($next2 === '!') {
+                    $statement .= ' ';
+                    $inCondition = true;
+                    $i += 2;
+                    while ($i + 1 < $len && preg_match('/[0-9]/', $line[$i + 1])) {
+                        $i++;
+                    }
+                    continue;
+                }
+                if ($next2 === 'M' && $i + 3 < $len && $line[$i + 3] === '!') {
+                    $statement .= ' ';
+                    if ($mariaDb) {
+                        // MariaDB wykonuje /*M!...*/; MySQL traktuje to jako
+                        // zwykly komentarz i pomija cala tresc.
+                        $inCondition = true;
+                        $i += 3;
+                        while ($i + 1 < $len && preg_match('/[0-9]/', $line[$i + 1])) {
+                            $i++;
+                        }
+                    } else {
+                        $inBlock = true;
+                        $i += 3;
+                    }
+                    continue;
+                }
+                $statement .= ' ';
+                $inBlock = true;
+                $i++;
+                continue;
+            }
+            $isDelimiter = ($delimiter === ';')
+                ? ($ch === ';')
+                : (substr($line, $i, strlen($delimiter)) === $delimiter);
+            if ($isDelimiter) {
+                $stmt = trim($statement);
+                $statement = '';
+                if ($stmt !== '') {
+                    call_user_func($callback, $stmt, $lineNo);
+                }
+                $i += strlen($delimiter) - 1;
+                continue;
+            }
+            $statement .= $ch;
+        }
+    }
+    } catch (Exception $e) {
+        fclose($fh);
+        throw $e;
+    }
+    fclose($fh);
+
+    if ($inString || $inBacktick || $inBlock || $inCondition) {
+        throw new Exception('Plik SQL jest niekompletny (niezamkniety cudzyslow, backtick albo komentarz) w linii ' . $lineNo . '.');
+    }
+    $stmt = trim($statement);
+    if ($stmt !== '') {
+        call_user_func($callback, $stmt, $lineNo);
+    }
+}
+
+function db_sync_native_is_maria($conn)
+{
+    try {
+        $rows = db_sync_native_fetch_all($conn, 'SELECT VERSION() AS version');
+        if (!empty($rows)) {
+            $version = db_sync_native_row_get($rows[0], 'version', '');
+            return (stripos($version, 'mariadb') !== false);
+        }
+    } catch (Exception $e) {
+        // brak odpowiedzi - zostaje zachowanie zgodne z MariaDB
+    }
+    return true;
+}
+
+function db_sync_native_import($creds, $host, $port, $sqlFile)
+{
+    $conn = db_sync_native_open($creds, $host, $port);
+    @db_sync_native_try($conn, 'SET NAMES utf8');
+    @db_sync_native_try($conn, 'SET SESSION max_allowed_packet=1073741824');
+    $mariaDb = db_sync_native_is_maria($conn);
+
+    $executed = 0;
+    try {
+        db_sync_sql_parse_file($sqlFile, function ($stmt, $line) use ($conn, &$executed) {
+            try {
+                $res = db_sync_native_query($conn, $stmt);
+                db_sync_native_free($conn, $res);
+            } catch (Exception $e) {
+                throw new Exception('linia ' . $line . ': ' . $e->getMessage()
+                    . ' [SQL: ' . db_sync_shorten_text($stmt, 220) . ']');
+            }
+            $executed++;
+            if ($executed % 1000 === 0) {
+                db_sync_log('IMPORT', 'wykonano ' . $executed . ' instrukcji (linia ' . $line . ')');
+            }
+        }, $mariaDb);
+    } catch (Exception $e) {
+        db_sync_native_close($conn);
+        throw new Exception('Import PHP zatrzymal sie: ' . $e->getMessage());
+    }
+    db_sync_native_close($conn);
+    db_sync_log('SYNC GOTOWY', 'baza ' . $creds['DB_NAME'] . ' zostala zaladowana z ' . basename($sqlFile)
+        . ' (' . $executed . ' instrukcji, tryb PHP)');
+}
+
 function db_sync_test_connection($creds, $host, $port)
 {
     $mysql = db_sync_get_param('MYSQL');
-    if ($mysql === '') {
+    if ($mysql !== '' && !db_sync_process_available()) {
+        db_sync_log('POLACZENIE Z BAZA', 'PHP (wbudowane) - MYSQL wskazany, ale brak funkcji uruchamiania procesow', true);
+        $mysql = '';
+    }
+    if ($mysql === '' && db_sync_process_available()) {
         $mysql = db_sync_find_binary(array('mysql', 'mysql.exe'), db_sync_binary_candidates('mysql'));
     }
-    if ($mysql === false) {
-        return 'nie mozna przetestowac (brak binarki mysql)';
+    if ($mysql === false || !db_sync_process_available()) {
+        return db_sync_native_test_connection($creds, $host, $port);
     }
 
     $cmd = db_sync_bin_arg($mysql)
@@ -387,7 +1587,9 @@ function db_sync_test_connection($creds, $host, $port)
 
     db_sync_exec($cmd, $out, $code);
     if ($code !== 0) {
-        return 'BLAD: ' . trim(implode("\n", $out));
+        $err = trim(implode("\n", $out));
+        db_sync_log('OSTRZEZENIE', 'mysql CLI: ' . $err . ' - testuje polaczenie przez PHP', true);
+        return db_sync_native_test_connection($creds, $host, $port);
     }
     return true;
 }
@@ -587,7 +1789,11 @@ function db_sync_render_archive_form($creds)
                 $note = htmlspecialchars(basename($st['bin'])) . ' na Windows moze pomijac nazwy z polskimi znakami - wybierz ZIP albo 7Z (7-Zip)';
             }
         } else {
-            $note = 'niedostepny: brak narzedzia (' . implode(' / ', $st['fmt']['tools']) . ')';
+            if (!db_sync_process_available()) {
+                $note = 'niedostepny: funkcje uruchamiania procesow sa wylaczone (uzyj ZIP)';
+            } else {
+                $note = 'niedostepny: brak narzedzia (' . implode(' / ', $st['fmt']['tools']) . ')';
+            }
         }
         if ($ok && $default === '') {
             $default = $key;
@@ -736,18 +1942,22 @@ function db_sync_binary_candidates($name)
 function db_sync_find_binary($names, $candidates = array(), $lookups = array('where', 'which'))
 {
     // 1) szukanie w PATH przez where (Windows) / which (Linux)
-    foreach ($names as $name) {
-        foreach ($lookups as $lookup) {
-            $out = array();
-            $code = -1;
-            db_sync_exec($lookup . ' ' . escapeshellarg($name) . ' 2>&1', $out, $code);
-            if ($code === 0 && !empty($out)) {
-                $path = trim($out[0]);
-                if ($path !== ''
-                    && stripos($path, 'not recognized') === false
-                    && stripos($path, 'not found') === false
-                    && stripos($path, 'could not find') === false) {
-                    return $path;
+    // Bez funkcji uruchamiania procesow pomijamy ten krok - nie mozna ani
+    // odpalic where/which, ani pozniej uzyc znalezionej binarki.
+    if (db_sync_process_available()) {
+        foreach ($names as $name) {
+            foreach ($lookups as $lookup) {
+                $out = array();
+                $code = -1;
+                db_sync_exec($lookup . ' ' . escapeshellarg($name) . ' 2>&1', $out, $code);
+                if ($code === 0 && !empty($out)) {
+                    $path = trim($out[0]);
+                    if ($path !== ''
+                        && stripos($path, 'not recognized') === false
+                        && stripos($path, 'not found') === false
+                        && stripos($path, 'could not find') === false) {
+                        return $path;
+                    }
                 }
             }
         }
@@ -778,7 +1988,9 @@ function db_sync_probe($binary, $getParam)
     }
     if ($bin === false) {
         $diag = array();
-        db_sync_exec('where ' . escapeshellarg($binary) . ' 2>&1', $diag, $diagCode);
+        if (db_sync_process_available()) {
+            db_sync_exec('where ' . escapeshellarg($binary) . ' 2>&1', $diag, $diagCode);
+        }
         throw new Exception(
             'Nie znaleziono binarki "' . $binary . '". Podaj sciezke recznie: ?' . $getParam . '=/pelna/sciezka/' . $binary
             . "\nSzczegoly: " . trim(implode("\n", $diag))
@@ -803,11 +2015,15 @@ function db_sync_probe($binary, $getParam)
 function db_sync_list_tables($creds, $host, $port)
 {
     $mysql = db_sync_get_param('MYSQL');
-    if ($mysql === '') {
+    if ($mysql !== '' && !db_sync_process_available()) {
+        $mysql = '';
+    }
+    if ($mysql === '' && db_sync_process_available()) {
         $mysql = db_sync_find_binary(array('mysql', 'mysql.exe'), db_sync_binary_candidates('mysql'));
     }
-    if ($mysql === false) {
-        throw new Exception('Nie moge pobrac listy tabel (brak binarki mysql). Podaj sciezke recznie: ?MYSQL=/pelna/sciezka/mysql');
+    if ($mysql === false || !db_sync_process_available()) {
+        db_sync_log('LISTA TABEL', 'PHP (wbudowane) - mysqli/PDO, bez mysql CLI');
+        return db_sync_native_list_tables($creds, $host, $port);
     }
 
     $sql = "SELECT table_name, IFNULL(data_length + index_length, 0) "
@@ -824,7 +2040,9 @@ function db_sync_list_tables($creds, $host, $port)
 
     db_sync_exec($cmd, $out, $code);
     if ($code !== 0) {
-        throw new Exception('Nie moge pobrac listy tabel: ' . trim(implode("\n", $out)));
+        db_sync_log('OSTRZEZENIE', 'mysql CLI nie pobral listy tabel: ' . trim(implode("\n", $out))
+            . ' - uzywam listy przez PHP', true);
+        return db_sync_native_list_tables($creds, $host, $port);
     }
 
     $tables = array();
@@ -943,30 +2161,55 @@ function db_sync_dump($creds, $host, $port, $exclude = array())
         db_sync_log('WYKLUCZONE TABELE', 'brak (pelny dump)');
     }
 
-    $mysqldump = db_sync_probe('mysqldump', 'MYSQLDUMP');
-
-    $cmd = db_sync_bin_arg($mysqldump)
-        . db_sync_conn_args($host, $port)
-        . ' --user=' . escapeshellarg($creds['DB_USER'])
-        . ' --password=' . escapeshellarg($creds['DB_PASSWORD'])
-        . ' --single-transaction --quick --skip-lock-tables --no-tablespaces'
-        . ' --default-character-set=utf8'
-        . ' --add-drop-table';
-    foreach ($exclude as $table) {
-        $cmd .= ' --ignore-table=' . escapeshellarg($creds['DB_NAME'] . '.' . $table);
+    $mysqldump = false;
+    if (db_sync_process_available()) {
+        $candidate = db_sync_get_param('MYSQLDUMP');
+        if ($candidate === '') {
+            $candidate = db_sync_find_binary(array('mysqldump', 'mysqldump.exe'), db_sync_binary_candidates('mysqldump'));
+        }
+        if ($candidate !== false) {
+            try {
+                $mysqldump = db_sync_probe('mysqldump', 'MYSQLDUMP');
+            } catch (Exception $e) {
+                db_sync_log('OSTRZEZENIE', 'mysqldump niedostepny: ' . $e->getMessage() . ' - uzywam dumpu PHP', true);
+            }
+        } else {
+            db_sync_log('OSTRZEZENIE', 'Nie znaleziono mysqldump - uzywam dumpu PHP (mysqli/PDO).', true);
+        }
+    } else {
+        db_sync_log('TRYB DUMPU', 'PHP (wbudowany) - funkcje uruchamiania procesow sa wylaczone');
     }
-    $cmd .= ' --result-file=' . escapeshellarg($sqlFile)
-        . ' ' . escapeshellarg($creds['DB_NAME'])
-        . ' 2>&1';
 
-    db_sync_log('KOMENDA', db_sync_mask_password($cmd));
-    db_sync_exec($cmd, $output, $code);
+    if ($mysqldump === false) {
+        db_sync_native_dump($creds, $host, $port, $exclude, $sqlFile);
+    } else {
+        $cmd = db_sync_bin_arg($mysqldump)
+            . db_sync_conn_args($host, $port)
+            . ' --user=' . escapeshellarg($creds['DB_USER'])
+            . ' --password=' . escapeshellarg($creds['DB_PASSWORD'])
+            . ' --single-transaction --quick --skip-lock-tables --no-tablespaces'
+            . ' --default-character-set=utf8'
+            . ' --add-drop-table';
+        foreach ($exclude as $table) {
+            $cmd .= ' --ignore-table=' . escapeshellarg($creds['DB_NAME'] . '.' . $table);
+        }
+        $cmd .= ' --result-file=' . escapeshellarg($sqlFile)
+            . ' ' . escapeshellarg($creds['DB_NAME'])
+            . ' 2>&1';
 
-    if ($code !== 0 || !is_file($sqlFile) || filesize($sqlFile) === 0) {
-        throw new Exception(
-            'mysqldump zakonczyl sie bledem (kod ' . $code . ').'
-            . "\n" . trim(implode("\n", $output))
-        );
+        db_sync_log('KOMENDA', db_sync_mask_password($cmd));
+        db_sync_exec($cmd, $output, $code);
+
+        if ($code !== 0 || !is_file($sqlFile) || filesize($sqlFile) === 0) {
+            throw new Exception(
+                'mysqldump zakonczyl sie bledem (kod ' . $code . ').'
+                . "\n" . trim(implode("\n", $output))
+            );
+        }
+    }
+
+    if (!is_file($sqlFile) || filesize($sqlFile) === 0) {
+        throw new Exception('Dump nie zostal utworzony (brak pliku albo plik jest pusty): ' . $sqlFile);
     }
 
     if (!empty($exclude)) {
@@ -1025,7 +2268,29 @@ function db_sync_import($creds, $host, $port, $file)
         throw new Exception('Plik ' . $sqlFile . ' jest pusty.');
     }
 
-    $mysql = db_sync_probe('mysql', 'MYSQL');
+    $mysql = false;
+    if (db_sync_process_available()) {
+        $candidate = db_sync_get_param('MYSQL');
+        if ($candidate === '') {
+            $candidate = db_sync_find_binary(array('mysql', 'mysql.exe'), db_sync_binary_candidates('mysql'));
+        }
+        if ($candidate !== false) {
+            try {
+                $mysql = db_sync_probe('mysql', 'MYSQL');
+            } catch (Exception $e) {
+                db_sync_log('OSTRZEZENIE', 'mysql niedostepny: ' . $e->getMessage() . ' - uzywam importu PHP', true);
+            }
+        } else {
+            db_sync_log('OSTRZEZENIE', 'Nie znaleziono mysql - uzywam importu PHP (mysqli/PDO).', true);
+        }
+    } else {
+        db_sync_log('TRYB IMPORTU', 'PHP (wbudowany) - funkcje uruchamiania procesow sa wylaczone');
+    }
+
+    if ($mysql === false) {
+        db_sync_native_import($creds, $host, $port, $sqlFile);
+        return;
+    }
 
     $cmd = db_sync_bin_arg($mysql)
         . db_sync_conn_args($host, $port)
@@ -1485,6 +2750,8 @@ function db_sync_archive_formats()
        zapas; na Windows odwrotnie - 7-Zip pierwszy, bo Info-ZIP gubi tam
        polskie znaki (db_sync_archive_tool_utf8_ok). */
     $zipTools = (PHP_OS_FAMILY === 'Windows') ? array('7z', 'zip') : array('zip', '7z');
+    // 'php' to zawsze dostepny zapas: ZipArchive albo wlasny writer ZIP.
+    $zipTools[] = 'php';
     return array(
         'zip'    => array('ext' => '.zip',    'label' => 'ZIP',    'tools' => $zipTools),
         '7z'     => array('ext' => '.7z',     'label' => '7Z',     'tools' => array('7z')),
@@ -1527,21 +2794,363 @@ function db_sync_archive_candidates($name)
     return $candidates;
 }
 
+/* ------------------------------------------------------------------ */
+/* Archiwum ZIP bez zewnetrznych narzedzi (fallback PHP)               */
+/* ------------------------------------------------------------------ */
+
+function db_sync_archive_zip_native_available()
+{
+    return class_exists('ZipArchive')
+        || (function_exists('fopen') && function_exists('fwrite') && function_exists('pack'));
+}
+
+function db_sync_archive_zip_native_label()
+{
+    return class_exists('ZipArchive') ? 'PHP ZipArchive' : 'PHP (wbudowany ZIP)';
+}
+
+function db_sync_archive_zip_dos_time($timestamp)
+{
+    $t = getdate((int) $timestamp);
+    $year = (int) $t['year'];
+    if ($year < 1980) {
+        $year = 1980;
+    }
+    if ($year > 2107) {
+        $year = 2107;
+    }
+    $time = (($t['hours'] & 0x1F) << 11) | (($t['minutes'] & 0x3F) << 5) | (($t['seconds'] >> 1) & 0x1F);
+    $date = (($year - 1980) << 9) | (($t['mon'] & 0x0F) << 5) | ($t['mday'] & 0x1F);
+    return array('time' => $time, 'date' => $date);
+}
+
+function db_sync_archive_zip_crc_bytes($hex)
+{
+    // ZIP przechowuje CRC32 w little-endian; hash('crc32b') daje big-endian hex.
+    $raw = pack('H*', $hex);
+    return strrev($raw);
+}
+
+function db_sync_archive_zip_create_ziparchive($root, $listFile, $part, $stats)
+{
+    $flags = defined('ZipArchive::CREATE') ? ZipArchive::CREATE : 0;
+    if (defined('ZipArchive::OVERWRITE')) {
+        $flags |= ZipArchive::OVERWRITE;
+    }
+    $zip = new ZipArchive();
+    $res = $zip->open($part, $flags);
+    if ($res !== true) {
+        throw new Exception('ZipArchive::open nie powiodlo sie (kod ' . $res . ').');
+    }
+    if (!function_exists('file')) {
+        $zip->close();
+        throw new Exception('ZipArchive wymaga funkcji file(), ktora jest wylaczona na serwerze.');
+    }
+    $lines = @file($listFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false) {
+        $zip->close();
+        throw new Exception('Nie moge odczytac listy plikow: ' . $listFile);
+    }
+    $count = 0;
+    foreach ($lines as $rel) {
+        $rel = rtrim($rel, "\r\n");
+        if ($rel === '') {
+            continue;
+        }
+        $abs = $root . '/' . $rel;
+        if (!is_file($abs)) {
+            $zip->close();
+            throw new Exception('Brak pliku do archiwum: ' . $rel);
+        }
+        if (!$zip->addFile($abs, $rel)) {
+            $zip->close();
+            throw new Exception('Nie moge dodac pliku do archiwum: ' . $rel);
+        }
+        $count++;
+    }
+    if (!$zip->close()) {
+        throw new Exception('ZipArchive::close nie powiodlo sie.');
+    }
+    if ($count !== (int) $stats['files']) {
+        throw new Exception('ZipArchive dodal ' . $count . ' z ' . $stats['files'] . ' plikow.');
+    }
+    return $count;
+}
+
+function db_sync_archive_zip_create_manual($root, $listFile, $part, $stats)
+{
+    if (!function_exists('fopen') || !function_exists('fwrite') || !function_exists('fgets')
+        || !function_exists('fread') || !function_exists('feof') || !function_exists('fclose')
+        || !function_exists('hash') || !function_exists('hash_init')
+        || !function_exists('hash_update') || !function_exists('hash_final')
+        || !function_exists('pack')) {
+        throw new Exception('Wbudowany writer ZIP wymaga funkcji fopen/fwrite/fgets/fread/hash_init, ktore sa wylaczone na serwerze.');
+    }
+    $fh = @fopen($part, 'wb');
+    if ($fh === false) {
+        throw new Exception('Nie moge utworzyc archiwum: ' . $part);
+    }
+    $central = array();
+    $offset  = 0;
+    $count   = 0;
+    $fhList  = @fopen($listFile, 'rb');
+    if ($fhList === false) {
+        fclose($fh);
+        @unlink($part);
+        throw new Exception('Nie moge odczytac listy plikow: ' . $listFile);
+    }
+
+    try {
+        while (($line = fgets($fhList)) !== false) {
+            $rel = rtrim($line, "\r\n");
+            if ($rel === '') {
+                continue;
+            }
+            $abs = $root . '/' . $rel;
+            if (!is_file($abs)) {
+                throw new Exception('Brak pliku do archiwum: ' . $rel);
+            }
+            $size = @filesize($abs);
+            if ($size === false) {
+                throw new Exception('Nie moge odczytac rozmiaru pliku: ' . $rel);
+            }
+            $mtime = @filemtime($abs);
+            if ($mtime === false) {
+                $mtime = time();
+            }
+            $perms = @fileperms($abs);
+            if ($perms === false) {
+                $perms = 0644;
+            }
+            $dos = db_sync_archive_zip_dos_time($mtime);
+
+            $method     = 0;
+            $compData   = null;
+            $crcHex     = '';
+            $compSize   = 0;
+            $uncompSize = 0;
+
+            // male pliki: kompresja deflate w pamieci (dobry kompromis)
+            if (function_exists('gzdeflate') && $size <= 33554432) {
+                $data = @file_get_contents($abs);
+                if ($data !== false) {
+                    $crcHex = hash('crc32b', $data);
+                    $deflated = @gzdeflate($data, 6);
+                    if ($deflated !== false && strlen($deflated) < strlen($data)) {
+                        $method     = 8;
+                        $compData   = $deflated;
+                        $compSize   = strlen($deflated);
+                        $uncompSize = strlen($data);
+                    } else {
+                        $compData   = $data;
+                        $compSize   = strlen($data);
+                        $uncompSize = strlen($data);
+                    }
+                }
+            }
+
+            $name    = str_replace('\\', '/', $rel);
+            $nameLen = strlen($name);
+            if ($nameLen > 65535) {
+                throw new Exception('Zbyt dluga nazwa pliku w ZIP: ' . $rel);
+            }
+            $flags = 0x0800 | 0x0008; // UTF-8 + data descriptor
+            $localHeader = pack('V', 0x04034b50)
+                . pack('v', 20)
+                . pack('v', $flags)
+                . pack('v', $method)
+                . pack('v', $dos['time'])
+                . pack('v', $dos['date'])
+                . pack('V', 0) . pack('V', 0) . pack('V', 0)
+                . pack('v', $nameLen)
+                . pack('v', 0)
+                . $name;
+            if (!db_sync_write_all($fh, $localHeader)) {
+                throw new Exception('Nie moge zapisac naglowka ZIP: ' . $rel);
+            }
+            $offset += strlen($localHeader);
+            $localOffset = $offset - strlen($localHeader);
+
+            if ($compData !== null) {
+                if (!db_sync_write_all($fh, $compData)) {
+                    throw new Exception('Nie moge zapisac danych ZIP: ' . $rel);
+                }
+                $offset += $compSize;
+            } else {
+                // duze pliki: metoda store, strumieniowo (bez ladowania do RAM)
+                $in = @fopen($abs, 'rb');
+                if ($in === false) {
+                    throw new Exception('Nie moge odczytac pliku: ' . $rel);
+                }
+                $crcCtx = hash_init('crc32b');
+                while (!feof($in)) {
+                    $chunk = fread($in, 1048576);
+                    if ($chunk === false) {
+                        fclose($in);
+                        throw new Exception('Blad odczytu pliku: ' . $rel);
+                    }
+                    if ($chunk === '') {
+                        continue;
+                    }
+                    hash_update($crcCtx, $chunk);
+                    if (!db_sync_write_all($fh, $chunk)) {
+                        fclose($in);
+                        throw new Exception('Nie moge zapisac danych ZIP: ' . $rel);
+                    }
+                    $uncompSize += strlen($chunk);
+                    $offset += strlen($chunk);
+                }
+                fclose($in);
+                $crcHex  = hash_final($crcCtx);
+                $compSize = $uncompSize;
+                $method   = 0;
+            }
+
+            if ($compSize > 0xFFFFFFFF || $uncompSize > 0xFFFFFFFF || $offset > 0xFFFFFFFF) {
+                throw new Exception('Wbudowany ZIP nie obsluguje plikow/archiwum powyzej 4 GB - uzyj ZipArchive albo narzedzia CLI.');
+            }
+            $crcBin = db_sync_archive_zip_crc_bytes($crcHex);
+            $desc = pack('V', 0x08074b50) . $crcBin
+                . pack('V', $compSize) . pack('V', $uncompSize);
+            if (!db_sync_write_all($fh, $desc)) {
+                throw new Exception('Nie moge zapisac deskryptora ZIP: ' . $rel);
+            }
+            $offset += strlen($desc);
+
+            $central[] = array(
+                'name'   => $name,
+                'flags'  => $flags,
+                'method' => $method,
+                'time'   => $dos['time'],
+                'date'   => $dos['date'],
+                'crc'    => $crcBin,
+                'comp'   => $compSize,
+                'uncomp' => $uncompSize,
+                'offset' => $localOffset,
+                'perms'  => $perms,
+            );
+            $count++;
+            if ($count > 0xFFFF) {
+                throw new Exception('Wbudowany ZIP obsluguje do 65535 plikow - uzyj ZipArchive albo narzedzia CLI.');
+            }
+        }
+        fclose($fhList);
+        $fhList = false;
+
+        if ($count > 0xFFFF) {
+            throw new Exception('Wbudowany ZIP obsluguje do 65535 plikow - uzyj ZipArchive albo narzedzia CLI.');
+        }
+        $cdStart = $offset;
+        $cdSize  = 0;
+        $versionMadeBy = (PHP_OS_FAMILY === 'Windows') ? 0x0014 : 0x031E;
+        foreach ($central as $entry) {
+            $nameLen = strlen($entry['name']);
+            $external = (PHP_OS_FAMILY === 'Windows') ? 0 : (($entry['perms'] & 0xFFFF) << 16);
+            if ($entry['offset'] > 0xFFFFFFFF || $entry['comp'] > 0xFFFFFFFF || $entry['uncomp'] > 0xFFFFFFFF) {
+                throw new Exception('Wbudowany ZIP nie obsluguje plikow/archiwum powyzej 4 GB - uzyj ZipArchive albo narzedzia CLI.');
+            }
+            $cd = pack('V', 0x02014b50)
+                . pack('v', $versionMadeBy)
+                . pack('v', 20)
+                . pack('v', $entry['flags'])
+                . pack('v', $entry['method'])
+                . pack('v', $entry['time'])
+                . pack('v', $entry['date'])
+                . $entry['crc']
+                . pack('V', $entry['comp'])
+                . pack('V', $entry['uncomp'])
+                . pack('v', $nameLen)
+                . pack('v', 0)
+                . pack('v', 0)
+                . pack('v', 0)
+                . pack('v', 0)
+                . pack('V', $external)
+                . pack('V', $entry['offset'])
+                . $entry['name'];
+            if (!db_sync_write_all($fh, $cd)) {
+                throw new Exception('Nie moge zapisac katalogu centralnego ZIP.');
+            }
+            $cdSize += strlen($cd);
+        }
+        if ($cdStart > 0xFFFFFFFF || $cdSize > 0xFFFFFFFF) {
+            throw new Exception('Wbudowany ZIP nie obsluguje archiwum powyzej 4 GB - uzyj ZipArchive albo narzedzia CLI.');
+        }
+        $eocd = pack('V', 0x06054b50)
+            . pack('v', 0) . pack('v', 0)
+            . pack('v', $count) . pack('v', $count)
+            . pack('V', $cdSize) . pack('V', $cdStart)
+            . pack('v', 0);
+        if (!db_sync_write_all($fh, $eocd)) {
+            throw new Exception('Nie moge zapisac stopki ZIP.');
+        }
+        if (!fclose($fh)) {
+            $fh = false;
+            throw new Exception('Nie moge zakonczyc zapisu archiwum ZIP (dysk pelny?).');
+        }
+        $fh = false;
+        if ($count !== (int) $stats['files']) {
+            throw new Exception('Wbudowany ZIP zapisal ' . $count . ' z ' . $stats['files'] . ' plikow.');
+        }
+    } catch (Exception $e) {
+        if (is_resource($fhList)) {
+            fclose($fhList);
+        }
+        if (is_resource($fh)) {
+            fclose($fh);
+        }
+        @unlink($part);
+        throw $e;
+    }
+    return $count;
+}
+
+function db_sync_archive_zip_create_native($root, $listFile, $part, $logFile, $statusFile, $stats, $forceManual = false)
+{
+    $engine = 'manual';
+    if (!$forceManual && class_exists('ZipArchive')) {
+        try {
+            db_sync_archive_zip_create_ziparchive($root, $listFile, $part, $stats);
+            $engine = 'ZipArchive';
+        } catch (Exception $e) {
+            db_sync_log('OSTRZEZENIE', 'ZipArchive: ' . $e->getMessage() . ' - probuje wbudowanego writera ZIP', true);
+            @unlink($part);
+        }
+    }
+    if ($engine !== 'ZipArchive') {
+        db_sync_archive_zip_create_manual($root, $listFile, $part, $stats);
+    }
+    $msg = 'PHP ZIP (' . $engine . '): ' . (int) $stats['files'] . ' plikow, '
+        . db_sync_human_size($stats['bytes']) . " danych zrodlowych\n";
+    if (@file_put_contents($logFile, $msg) === false) {
+        @unlink($part);
+        throw new Exception('Nie moge zapisac logu archiwum: ' . $logFile);
+    }
+    if (@file_put_contents($statusFile, "exit=0\n") === false) {
+        @unlink($part);
+        throw new Exception('Nie moge zapisac statusu archiwum: ' . $statusFile);
+    }
+    return true;
+}
+
 function db_sync_archive_tools()
 {
     static $tools = null;
     if ($tools !== null) {
         return $tools;
     }
+    $process = db_sync_process_available();
     $lookups = (PHP_OS_FAMILY === 'Windows') ? array('where') : array('which');
     $tools   = array();
     foreach (db_sync_archive_tool_names() as $key => $names) {
         // reczne wskazanie sciezki w URL, np. ?7Z=/pelna/sciezka/7z
         $param = db_sync_get_param(db_sync_archive_tool_arg($key));
         if ($param !== '') {
-            if (is_file($param)) {
+            if ($process && is_file($param)) {
                 $tools[$key] = $param;
             }
+            continue;
+        }
+        if (!$process) {
             continue;
         }
         $candidates = array();
@@ -1554,6 +3163,9 @@ function db_sync_archive_tools()
         if ($bin !== false) {
             $tools[$key] = $bin;
         }
+    }
+    if (db_sync_archive_zip_native_available()) {
+        $tools['php'] = db_sync_archive_zip_native_label();
     }
     return $tools;
 }
@@ -1589,7 +3201,8 @@ function db_sync_archive_tool_utf8_ok($tool)
     if (PHP_OS_FAMILY !== 'Windows') {
         return true;
     }
-    return ($tool === '7z');
+    // 'php' zapisuje nazwy jako UTF-8 z flaga jezykowa ZIP - jest bezpieczny.
+    return ($tool === '7z' || $tool === 'php');
 }
 
 function db_sync_archive_default_exclude()
@@ -2012,6 +3625,10 @@ function db_sync_archive_create($format, $patterns, $creds)
     $st  = $status[$format];
     $fmt = $st['fmt'];
     if (!$st['ok']) {
+        if (!db_sync_process_available()) {
+            throw new Exception('Format ' . $fmt['label'] . ' wymaga zewnetrznego narzedzia, a na serwerze sa wylaczone funkcje uruchamiania procesow.'
+                . ' Wybierz format ZIP - jest obslugiwany przez wbudowany mechanizm PHP.');
+        }
         throw new Exception('Brak narzedzia do formatu ' . $fmt['label'] . ' (wymagane: ' . implode(' / ', $fmt['tools']) . ').'
             . ' Zainstaluj narzedzie albo podaj sciezke recznie, np. ?' . db_sync_archive_tool_arg($fmt['tools'][0]) . '=/pelna/sciezka.');
     }
@@ -2069,24 +3686,40 @@ function db_sync_archive_create($format, $patterns, $creds)
             . ', dane zrodlowe ' . db_sync_human_size($stats['bytes']) . ' (wymagany zapas 50 MB).');
     }
 
-    $cmd = db_sync_archive_command($tool, $format, $bin, $listFile, $part);
-    db_sync_log('NARZEDZIE', basename($bin) . ' (' . $bin . ')');
-    db_sync_log('KOMENDA', $cmd . '   [cwd: ' . $root . ']');
+    if ($tool === 'php') {
+        // Wbudowany writer ZIP: dziala nawet przy calkowicie wylaczonych
+        // funkcjach uruchamiania procesow. Plik .part i plik statusu sa
+        // zgodne z mechanizmem odtwarzania przerwanych archiwow.
+        db_sync_log('NARZEDZIE', db_sync_archive_zip_native_label());
+        db_sync_log('KOMENDA', 'PHP ZIP: ' . $stats['files'] . ' plikow   [cwd: ' . $root . ']');
+        try {
+            db_sync_archive_zip_create_native($root, $listFile, $part, $logFile, $statusFile, $stats);
+        } catch (Exception $e) {
+            db_sync_archive_unlink(array($listFile, $logFile, $statusFile, $part));
+            throw $e;
+        }
+        $execCode   = 0;
+        $statusCode = 0;
+    } else {
+        $cmd = db_sync_archive_command($tool, $format, $bin, $listFile, $part);
+        db_sync_log('NARZEDZIE', basename($bin) . ' (' . $bin . ')');
+        db_sync_log('KOMENDA', $cmd . '   [cwd: ' . $root . ']');
 
-    // cwd procesu potomnego = katalog serwisu (sciezki na liscie sa wzgledne),
-    // wyjscie narzedzia -> plik logu (nie do pamieci PHP);
-    // dopisek statusu zapisuje kod wyjscia narzedzia takze po ubiciu PHP
-    $oldCwd = function_exists('getcwd') ? getcwd() : false;
-    @chdir($root);
-    db_sync_exec($cmd . ' > ' . db_sync_bin_arg($logFile) . ' 2>&1' . db_sync_archive_status_suffix($statusFile), $outIgnored, $execCode);
-    if ($oldCwd !== false) {
-        @chdir($oldCwd);
+        // cwd procesu potomnego = katalog serwisu (sciezki na liscie sa wzgledne),
+        // wyjscie narzedzia -> plik logu (nie do pamieci PHP);
+        // dopisek statusu zapisuje kod wyjscia narzedzia takze po ubiciu PHP
+        $oldCwd = function_exists('getcwd') ? getcwd() : false;
+        @chdir($root);
+        db_sync_exec($cmd . ' > ' . db_sync_bin_arg($logFile) . ' 2>&1' . db_sync_archive_status_suffix($statusFile), $outIgnored, $execCode);
+        if ($oldCwd !== false) {
+            @chdir($oldCwd);
+        }
+
+        // kod wyjscia czytamy z pliku statusu - dopisane polecenia powloki
+        // zmieniaja wartosc zwracana przez exec()
+        $statusCode = db_sync_archive_status_code($statusFile);
     }
-
-    // kod wyjscia czytamy z pliku statusu - dopisane polecenia powloki
-    // zmieniaja wartosc zwracana przez exec()
-    $statusCode = db_sync_archive_status_code($statusFile);
-    $code       = ($statusCode === null) ? (int) $execCode : $statusCode;
+    $code = ($statusCode === null) ? (int) $execCode : $statusCode;
 
     $tail  = db_sync_archive_log_tail($logFile);
     $found = db_sync_archive_output_errors($tail);
