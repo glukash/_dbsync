@@ -87,6 +87,23 @@ error_reporting(E_ALL);
 ini_set('display_errors', 1);
 ini_set('memory_limit', '512M');
 set_time_limit(0);
+
+/* Hostingi z open_basedir/site sandbox zglaszaja ostrzezenia o katalogach
+   systemowych (/usr/bin itd.) i wylaczonym exec() - sa one oczekiwane przy
+   wykrywaniu narzedzi CLI. Tlumimy tylko te dwa komunikaty; bledy oraz
+   pozostale ostrzezenia nadal sa wyswietlane. */
+set_error_handler(function ($errno, $errstr) {
+    if (!(error_reporting() & $errno)) {
+        return false;
+    }
+    if (($errno === E_WARNING || $errno === E_NOTICE)
+        && (stripos($errstr, 'open_basedir restriction') !== false
+            || stripos($errstr, 'has been disabled for security reasons') !== false)) {
+        return true;
+    }
+    return false;
+});
+
 header('Content-Type: text/html; charset=utf-8');
 
 /* ---- Polyfill dla PHP < 5.6 ---- */
@@ -127,8 +144,8 @@ define('DBSYNC_AUTH_PASS_HASH', '$2y$12$EkVxv90j9DnzYPAg2K1vTOrcV46VmWiaQ8sqVmTj
 
 /* Wersja skryptu (podbijana przy kazdym wydaniu) i repozytorium GitHub, */
 /* z ktorego sprawdzane sa i pobierane aktualizacje (branch main). */
-define('DBSYNC_DATE', '2026-11-05');
-define('DBSYNC_VERSION', '1.11.0');
+define('DBSYNC_DATE', '2026-11-09');
+define('DBSYNC_VERSION', '1.11.1');
 define('DBSYNC_GITHUB_REPO', 'glukash/_dbsync');
 define('DBSYNC_GITHUB_BRANCH', 'main');
 
@@ -162,6 +179,57 @@ function db_sync_mask_password($cmd)
     return preg_replace('/--password=\S+/', '--password=***', $cmd);
 }
 
+/* Czy funkcja jest dostepna i nie zostala zablokowana przez disable_functions?
+   Na hostingach (np. Hostido) exec() istnieje, ale jego wywolanie konczy sie
+   warningiem sandboxa - dzieki temu sprawdzeniu w ogole go nie dotykamy. */
+function db_sync_function_enabled($name)
+{
+    if (!function_exists($name)) {
+        return false;
+    }
+    $disabled = (string) ini_get('disable_functions');
+    if ($disabled === '') {
+        return true;
+    }
+    foreach (explode(',', $disabled) as $item) {
+        if (strcasecmp(trim($item), $name) === 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Czy sciezka lezy w open_basedir? Pozwala nie wywolywac is_file()/is_dir()
+   dla katalogow systemowych (/usr/bin itd.), ktore na hostingu i tak sa
+   poza dozwolonymi sciezkami (bez tego PHP sypie warningami). */
+function db_sync_path_allowed($path)
+{
+    $open = (string) ini_get('open_basedir');
+    if (trim($open) === '') {
+        return true;
+    }
+    $path = str_replace('\\', '/', (string) $path);
+    $real = @realpath($path);
+    if ($real !== false) {
+        $path = str_replace('\\', '/', $real);
+    }
+    $separator = (DIRECTORY_SEPARATOR === '\\') ? ';' : ':';
+    foreach (explode($separator, $open) as $dir) {
+        $dir = rtrim(str_replace('\\', '/', trim($dir)), '/');
+        if ($dir === '') {
+            continue;
+        }
+        $realDir = @realpath($dir);
+        if ($realDir !== false) {
+            $dir = rtrim(str_replace('\\', '/', $realDir), '/');
+        }
+        if ($path === $dir || strpos($path, $dir . '/') === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Zwraca nazwe pierwszej dostepnej funkcji uruchamiania procesow albo ''.
    Kolejnosc: exec (zachowanie historyczne), potem bezpieczne zamienniki.
    Dzieki temu serwer z disable_functions=exec, ale z proc_open/system,
@@ -182,7 +250,7 @@ function db_sync_process_runner()
         if ($name === 'popen' && !function_exists('pclose')) {
             continue;
         }
-        if (function_exists($name)) {
+        if (db_sync_function_enabled($name)) {
             $runner = $name;
             return $runner;
         }
@@ -346,7 +414,8 @@ function db_sync_exec($cmd, &$output, &$code)
     $code   = -1;
     $runner = db_sync_process_runner();
     if ($runner === 'exec') {
-        exec($cmd, $output, $code);
+        // @ - sandbox hostingu potrafi zwrocic warning przy kazdym wywolaniu
+        @exec($cmd, $output, $code);
         return;
     }
     if ($runner === 'proc_open') {
@@ -1916,11 +1985,11 @@ function db_sync_binary_candidates($name)
         );
         $exe = $name . '.exe';
         foreach ($roots as $root) {
-            if (!is_dir($root)) {
+            if (!db_sync_path_allowed($root) || !@is_dir($root)) {
                 continue;
             }
             $candidates[] = $root . '/' . $exe;
-            foreach (glob($root . '/*/bin/' . $exe) ?: array() as $p) {
+            foreach (@glob($root . '/*/bin/' . $exe) ?: array() as $p) {
                 $candidates[] = $p;
             }
         }
@@ -1964,7 +2033,10 @@ function db_sync_find_binary($names, $candidates = array(), $lookups = array('wh
     }
     // 2) sprawdzenie znanych katalogow
     foreach ($candidates as $candidate) {
-        if (is_file($candidate) && (PHP_OS_FAMILY === 'Windows' || is_executable($candidate))) {
+        if (!db_sync_path_allowed($candidate)) {
+            continue;
+        }
+        if (@is_file($candidate) && (PHP_OS_FAMILY === 'Windows' || @is_executable($candidate))) {
             return $candidate;
         }
     }
@@ -2787,7 +2859,7 @@ function db_sync_archive_candidates($name)
         $roots = array('/usr/bin', '/bin', '/usr/local/bin', '/usr/sbin', '/sbin', '/snap/bin', '/opt/lampp/bin');
     }
     foreach ($roots as $root) {
-        if (is_dir($root)) {
+        if (db_sync_path_allowed($root) && @is_dir($root)) {
             $candidates[] = $root . '/' . $name;
         }
     }
@@ -3145,7 +3217,7 @@ function db_sync_archive_tools()
         // reczne wskazanie sciezki w URL, np. ?7Z=/pelna/sciezka/7z
         $param = db_sync_get_param(db_sync_archive_tool_arg($key));
         if ($param !== '') {
-            if ($process && is_file($param)) {
+            if ($process && @is_file($param)) {
                 $tools[$key] = $param;
             }
             continue;
